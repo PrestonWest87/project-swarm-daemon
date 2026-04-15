@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
