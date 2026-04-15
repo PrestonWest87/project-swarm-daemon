@@ -1,6 +1,7 @@
 mod store;
 mod sync;
 mod crypto;
+mod kex;
 
 use futures::StreamExt;
 use libp2p::{
@@ -9,7 +10,7 @@ use libp2p::{
     identity, PeerId,
 };
 use libp2p::multiaddr::Multiaddr;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
@@ -17,6 +18,7 @@ use std::time::Duration;
 use tokio::io::{self, AsyncBufReadExt};
 
 use store::{DagMessage, Store};
+use kex::{KexRequest, KexResponse, KEX_PROTOCOL_NAME};
 
 async fn try_aggressive_nat(ports: Vec<u16>) -> Option<u16> {
     println!("[NETWORK] Tier 2: Initiating Aggressive NAT-PMP sequence across {} ports...", ports.len());
@@ -50,6 +52,7 @@ struct SwarmProtocol {
     mdns: mdns::tokio::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     req_res: request_response::cbor::Behaviour<sync::SyncRequest, sync::SyncResponse>,
+    kex: request_response::cbor::Behaviour<KexRequest, KexResponse>,
     identify: identify::Behaviour,
     autonat: autonat::Behaviour,
     dcutr: dcutr::Behaviour,
@@ -61,7 +64,7 @@ struct SwarmProtocol {
 async fn main() -> Result<(), Box<dyn Error>> {
     let db = Store::new().expect("Failed to initialize SQLite database");
     println!("[SYSTEM] Local DAG database initialized.");
-  
+
     println!("[SYSTEM] Generating Hybrid X25519 + ML-KEM Cryptographic Keys...");
     let my_crypto_id = crypto::HybridIdentity::generate();
     println!("[SYSTEM] Quantum-resistant identity secured.");
@@ -105,6 +108,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         request_response::Config::default(),
     );
 
+    let kex_behaviour = request_response::cbor::Behaviour::new(
+        [(KEX_PROTOCOL_NAME, request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+
     let identify_behaviour = identify::Behaviour::new(identify::Config::new(
         "/project-swarm/1.0.0".into(),
         local_key.public(),
@@ -124,6 +132,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         mdns: mdns_behaviour,
         kademlia: kad_behaviour,
         req_res: req_res_behaviour,
+        kex: kex_behaviour,
         identify: identify_behaviour,
         autonat: autonat_behaviour,
         dcutr: dcutr_behaviour,
@@ -148,6 +157,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut synced_peers = HashSet::new();
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
     let mut cascade_triggered = false;
+    
+    let mut key_ring: HashMap<PeerId, KexResponse> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -159,8 +170,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("--- YOUR MAGIC INVITE LINKS ---");
                     for addr in &listen_addrs {
                         let addr_str = addr.to_string();
-                        
-                        // Restrictive filter for local/virtualized network clutter
                         if addr_str.contains("/127.0.0.1/") || 
                            addr_str.contains("/169.254.") || 
                            addr_str.contains("/172.") || 
@@ -168,7 +177,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                            (addr_str.contains("/192.168.") && !addr_str.contains("/192.168.1.")) {
                             continue;
                         }
-
                         println!("/connect {}/p2p/{}", addr, local_peer_id);
                     }
                     println!("------------------------------------");
@@ -201,6 +209,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     println!("---------------------------");
                     continue; 
+                }
+
+                // WHISPER COMMAND
+                if input.starts_with("/whisper ") {
+                    let parts: Vec<&str> = input.splitn(3, ' ').collect();
+                    if parts.len() == 3 {
+                        let target_peer_str = parts[1];
+                        let message_text = parts[2];
+                        
+                        if let Ok(target_peer) = target_peer_str.parse::<PeerId>() {
+                            if let Some(target_keys) = key_ring.get(&target_peer) {
+                                if let Ok(bundle) = crypto::seal_for_network(
+                                    message_text.as_bytes(),
+                                    &target_keys.x25519_pub,
+                                    &target_keys.mlkem_pub
+                                ) {
+                                    let payload = serde_json::to_vec(&bundle).unwrap();
+                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload);
+                                    println!("[SYSTEM] ML-KEM encrypted whisper sent to {}.", target_peer);
+                                }
+                            } else {
+                                println!("[ERROR] Public keys for {} not in KeyRing. Have they connected?", target_peer);
+                            }
+                        } else {
+                            println!("[ERROR] Invalid PeerId format.");
+                        }
+                    } else {
+                        println!("[SYSTEM] Usage: /whisper <PeerId> <Message>");
+                    }
+                    continue;
                 }
 
                 let parents = db.get_latest_leaves().unwrap_or_default();
@@ -238,12 +276,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if !cascade_triggered {
                         cascade_triggered = true;
                         println!("[NETWORK] Tier 1 Failed: Local router rejected UPnP.");
-                        
                         let ports_to_try = vec![4001, 50000, 50001, 51000, 60000];
-                        
                         tokio::spawn(async move {
                             if let Some(_ext_port) = try_aggressive_nat(ports_to_try).await {
-                                // Success handled inside try_aggressive_nat
                             } else {
                                 println!("[NETWORK] Awaiting manual port forward or local peer connections.");
                             }
@@ -270,12 +305,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
 
-                    if synced_peers.insert(peer_id) {
-                        let known_leaves = db.get_latest_leaves().unwrap_or_default();
-                        swarm.behaviour_mut().req_res.send_request(
-                            &peer_id,
-                            sync::SyncRequest { known_leaves }
-                        );
+                    println!("[SECURITY] Initiating Post-Quantum Key Exchange with {}...", peer_id);
+                    swarm.behaviour_mut().kex.send_request(
+                        &peer_id,
+                        my_crypto_id.to_kex_request()
+                    );
+                }
+
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Kex(request_response::Event::Message { peer, message })) => match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        println!("[SECURITY] Received KEX Request from {}", peer);
+                        key_ring.insert(peer, KexResponse {
+                            x25519_pub: request.x25519_pub,
+                            mlkem_pub: request.mlkem_pub,
+                        });
+                        let _ = swarm.behaviour_mut().kex.send_response(channel, my_crypto_id.to_kex_response());
+
+                        if synced_peers.insert(peer) {
+                            let known_leaves = db.get_latest_leaves().unwrap_or_default();
+                            swarm.behaviour_mut().req_res.send_request(&peer, sync::SyncRequest { known_leaves });
+                        }
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        println!("[SECURITY] KEX Handshake successful with {}", peer);
+                        key_ring.insert(peer, response);
+
+                        if synced_peers.insert(peer) {
+                            let known_leaves = db.get_latest_leaves().unwrap_or_default();
+                            swarm.behaviour_mut().req_res.send_request(&peer, sync::SyncRequest { known_leaves });
+                        }
                     }
                 }
 
@@ -288,7 +346,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
-                    if let Ok(dag_msg) = serde_json::from_slice::<DagMessage>(&message.data) {
+                    if let Ok(bundle) = serde_json::from_slice::<crypto::EncryptedBundle>(&message.data) {
+                        if let Ok(decrypted) = crypto::open_payload(&bundle, &my_crypto_id) {
+                            let text = String::from_utf8_lossy(&decrypted);
+                            let sender = message.source.map(|p| p.to_string()).unwrap_or_else(|| "Unknown".to_string());
+                            println!("[WHISPER] From [{}]: {}", &sender[..8], text);
+                        }
+                    } 
+                    else if let Ok(dag_msg) = serde_json::from_slice::<DagMessage>(&message.data) {
                         if let Err(e) = db.save_message(&dag_msg) {
                             println!("[ERROR] Failed to write incoming message: {}", e);
                         }
