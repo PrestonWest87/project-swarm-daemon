@@ -1,3 +1,4 @@
+// src/main.rs
 mod store;
 mod sync;
 mod crypto;
@@ -10,7 +11,6 @@ use libp2p::{
     identity, PeerId, Multiaddr, tcp, noise, yamux
 };
 use pqcrypto_traits::kem::PublicKey;
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
@@ -21,7 +21,6 @@ use tokio::io::{self, AsyncBufReadExt};
 use store::{DagMessage, Store};
 use kex::{KexRequest, KexResponse, KEX_PROTOCOL_NAME};
 
-// Standard public IPFS/libp2p bootstrap nodes used for global DHT routing
 const BOOTSTRAP_NODES: &[&str] = &[
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXBPxW8V92uMb",
@@ -44,7 +43,6 @@ struct SwarmProtocol {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Thread-safe Store wrapped in Arc<Mutex> for non-blocking async access
     let db = Arc::new(Mutex::new(Store::new().expect("Failed to initialize SQLite database")));
     println!("[SYSTEM] Local DAG database initialized.");
 
@@ -84,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let kad_store = kad::store::MemoryStore::new(local_peer_id);
     let mut kad_behaviour = kad::Behaviour::new(local_peer_id, kad_store);
-    kad_behaviour.set_mode(Some(kad::Mode::Server)); // Actively participate in routing
+    kad_behaviour.set_mode(Some(kad::Mode::Server));
 
     let req_res_behaviour = request_response::cbor::Behaviour::new(
         [(sync::SYNC_PROTOCOL_NAME, request_response::ProtocolSupport::Full)],
@@ -121,19 +119,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
         .with_tokio()
-        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)? // Fallback TCP transport
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_quic()
         .with_dns()? 
         .with_behaviour(|_| behaviour)?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
-    // Listen on both QUIC (UDP) and TCP for maximum NAT penetration
     let static_port = 4001;
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", static_port).parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", static_port).parse()?)?;
 
-    // Dial Bootstrap Relays
     for node in BOOTSTRAP_NODES {
         if let Ok(addr) = node.parse::<Multiaddr>() {
             println!("[NETWORK] Dialing public bootstrap relay: {}", addr);
@@ -145,9 +141,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     println!("[SYSTEM] Network Engine Online. Type a message to broadcast.");
 
-    let mut synced_peers = HashSet::new();
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
-    let mut key_ring: HashMap<PeerId, KexResponse> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -185,39 +179,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 if input == "/history" {
-                    println!("--- LOCAL DAG HISTORY ---");
-                    match db.get_all_messages() {
-                        Ok(messages) => {
+                    println!("--- LOCAL DAG HISTORY (LAST 50) ---");
+                    let db_clone = Arc::clone(&db);
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(messages) = db_clone.lock().unwrap().get_recent_messages(50) {
                             for msg in messages {
                                 println!("[{}] (Hash: {}): {}", &msg.author[..8], &msg.id[..8], msg.content);
                             }
                         }
-                        Err(e) => println!("[ERROR] Failed to read history: {}", e),
-                    }
+                    }).await.unwrap();
                     println!("---------------------------");
                     continue; 
                 }
 
-                // WHISPER COMMAND
                 if input.starts_with("/whisper ") {
                     let parts: Vec<&str> = input.splitn(3, ' ').collect();
                     if parts.len() == 3 {
                         let target_peer_str = parts[1];
-                        let message_text = parts[2];
+                        let message_text = parts[2].to_string();
                         
                         if let Ok(target_peer) = target_peer_str.parse::<PeerId>() {
-                            if let Some(target_keys) = key_ring.get(&target_peer) {
+                            let db_clone = Arc::clone(&db);
+                            let target_str = target_peer.to_string();
+                            let keys = tokio::task::spawn_blocking(move || {
+                                db_clone.lock().unwrap().get_peer_keys(&target_str).unwrap_or(None)
+                            }).await.unwrap();
+
+                            if let Some((x25519_pub, mlkem_pub)) = keys {
                                 if let Ok(bundle) = crypto::seal_for_network(
                                     message_text.as_bytes(),
-                                    &target_keys.x25519_pub,
-                                    &target_keys.mlkem_pub
+                                    &x25519_pub,
+                                    &mlkem_pub
                                 ) {
                                     let payload = serde_json::to_vec(&bundle).unwrap();
                                     let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload);
                                     println!("[SYSTEM] ML-KEM encrypted whisper sent to {}.", target_peer);
                                 }
                             } else {
-                                println!("[ERROR] Public keys for {} not in KeyRing. Have they connected?", target_peer);
+                                println!("[ERROR] Public keys for {} not found in database.", target_peer);
                             }
                         } else {
                             println!("[ERROR] Invalid PeerId format.");
@@ -228,14 +227,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
 
-                // ... keep the /history and /invite and /whisper logic identical ...
-
                 let db_clone = Arc::clone(&db);
                 let local_author_clone = local_author_id.clone();
                 let input_clone = input.to_string();
                 let topic_clone = topic.clone();
                 
-                // ASYNC FIX: Spawn blocking task for SQLite operations
                 let parents = tokio::task::spawn_blocking(move || {
                     let lock = db_clone.lock().unwrap();
                     let p = lock.get_latest_leaves().unwrap_or_default();
@@ -266,7 +262,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
 
-                    // Authenticate the Key Exchange
                     let mut payload_to_sign = my_crypto_id.x25519_public.to_bytes().to_vec();
                     payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
                     let signature = local_key.sign(&payload_to_sign).unwrap();
@@ -287,7 +282,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let mut verify_payload = request.x25519_pub.clone();
                         verify_payload.extend_from_slice(&request.mlkem_pub);
                         
-                        // Extract Peer's Ed25519 public key and verify signature
                         let pub_key = libp2p::identity::PublicKey::try_decode_protobuf(&peer.to_bytes()[2..]).unwrap();
                         if !pub_key.verify(&verify_payload, &request.signature) {
                             println!("[SECURITY] Critical: KEX Signature verification failed for {}!", peer);
@@ -295,11 +289,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         println!("[SECURITY] Authenticated KEX Request from {}", peer);
-                        key_ring.insert(peer, KexResponse {
-                            x25519_pub: request.x25519_pub,
-                            mlkem_pub: request.mlkem_pub,
-                            signature: request.signature,
-                        });
+                        
+                        let db_clone = Arc::clone(&db);
+                        let peer_str = peer.to_string();
+                        let req_clone = request.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = db_clone.lock().unwrap().save_peer_keys(&peer_str, &req_clone.x25519_pub, &req_clone.mlkem_pub, &req_clone.signature);
+                        }).await.unwrap();
                         
                         let mut payload_to_sign = my_crypto_id.x25519_public.to_bytes().to_vec();
                         payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
@@ -310,6 +306,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             mlkem_pub: my_crypto_id.mlkem_public.as_bytes().to_vec(),
                             signature,
                         });
+
+                        let known_leaves = db.lock().unwrap().get_latest_leaves().unwrap_or_default();
+                        swarm.behaviour_mut().req_res.send_request(&peer, sync::SyncRequest { known_leaves });
                     }
                     request_response::Message::Response { response, .. } => {
                         let mut verify_payload = response.x25519_pub.clone();
@@ -322,11 +321,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
 
                         println!("[SECURITY] KEX Handshake successful with {}", peer);
-                        key_ring.insert(peer, response);
+                        
+                        let db_clone = Arc::clone(&db);
+                        let peer_str = peer.to_string();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = db_clone.lock().unwrap().save_peer_keys(&peer_str, &response.x25519_pub, &response.mlkem_pub, &response.signature);
+                        }).await.unwrap();
+
+                        let known_leaves = db.lock().unwrap().get_latest_leaves().unwrap_or_default();
+                        swarm.behaviour_mut().req_res.send_request(&peer, sync::SyncRequest { known_leaves });
+                    }
+                }
+
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
+                    if let Ok(bundle) = serde_json::from_slice::<crypto::EncryptedBundle>(&message.data) {
+                        if let Ok(decrypted) = crypto::open_payload(&bundle, &my_crypto_id) {
+                            let text = String::from_utf8_lossy(&decrypted);
+                            let sender = message.source.map(|p| p.to_string()).unwrap_or_else(|| "Unknown".to_string());
+                            println!("[WHISPER] From [{}]: {}", &sender[..8], text);
+                        }
+                    } 
+                    else if let Ok(dag_msg) = serde_json::from_slice::<DagMessage>(&message.data) {
+                        let db_clone = Arc::clone(&db);
+                        tokio::task::spawn_blocking(move || {
+                            // 1. Save to the database
+                            let _ = db_clone.lock().unwrap().save_message(&dag_msg);
+                            // 2. Print it to the console while we still own it inside the closure
+                            println!("[{}] (Hash: {}): {}", &dag_msg.author[..8], &dag_msg.id[..8], dag_msg.content);
+                        }).await.unwrap();
                     }
                 }
                 
-                // Add your other standard event matchers (Gossipsub, req_res sync) here wrapped in spawn_blocking where writing to db
+                SwarmEvent::Behaviour(SwarmProtocolEvent::ReqRes(request_response::Event::Message { peer, message })) => match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        let db_clone = Arc::clone(&db);
+                        let missing = tokio::task::spawn_blocking(move || {
+                            db_clone.lock().unwrap().get_messages_after(&request.known_leaves).unwrap_or_default()
+                        }).await.unwrap();
+                        
+                        let _ = swarm.behaviour_mut().req_res.send_response(
+                            channel,
+                            sync::SyncResponse { missing_messages: missing }
+                        );
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        if !response.missing_messages.is_empty() {
+                            println!("[SYNC] Received {} missing messages from {}", response.missing_messages.len(), peer);
+                            let db_clone = Arc::clone(&db);
+                            tokio::task::spawn_blocking(move || {
+                                let lock = db_clone.lock().unwrap();
+                                for msg in response.missing_messages {
+                                    let _ = lock.save_message(&msg);
+                                }
+                            }).await.unwrap();
+                        }
+                    }
+                }
                 _ => {}
             }
         }

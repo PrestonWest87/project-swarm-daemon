@@ -1,6 +1,7 @@
+// src/crypto.rs
 use serde::{Deserialize, Serialize};
 use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::{Ciphertext, SharedSecret, PublicKey as PqPublicKey};
+use pqcrypto_traits::kem::{Ciphertext, SharedSecret};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 use chacha20poly1305::{aead::{Aead, AeadCore, KeyInit}, ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
@@ -25,21 +26,6 @@ impl HybridIdentity {
             x25519_public,
             mlkem_secret,
             mlkem_public,
-        }
-    }
-}
-
-    pub fn to_kex_request(&self) -> KexRequest {
-        KexRequest {
-            x25519_pub: self.x25519_public.to_bytes().to_vec(),
-            mlkem_pub: self.mlkem_public.as_bytes().to_vec(),
-        }
-    }
-
-    pub fn to_kex_response(&self) -> KexResponse {
-        KexResponse {
-            x25519_pub: self.x25519_public.to_bytes().to_vec(),
-            mlkem_pub: self.mlkem_public.as_bytes().to_vec(),
         }
     }
 }

@@ -3,13 +3,12 @@ use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-// This is the actual payload that will travel across the mesh
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DagMessage {
-    pub id: String,          // The SHA256 hash of this message
-    pub author: String,      // The Public Key of the sender
-    pub parents: Vec<String>,// The hashes of the messages that came before this one
-    pub content: String,     // The actual text message (soon to be End-to-End Encrypted)
+    pub id: String,          
+    pub author: String,      
+    pub parents: Vec<String>,
+    pub content: String,     
 }
 
 impl DagMessage {
@@ -24,7 +23,6 @@ impl DagMessage {
         msg
     }
 
-    // Hash the payload so it becomes an immutable block in the DAG
     pub fn calculate_hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(&self.author);
@@ -42,10 +40,8 @@ pub struct Store {
 
 impl Store {
     pub fn new() -> Result<Self> {
-        // Creates a local SQLite file in the directory you run the daemon from
         let conn = Connection::open("swarm_dag.db")?;
         
-        // Initialize the table if it doesn't exist
         conn.execute(
             "CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
@@ -55,12 +51,22 @@ impl Store {
             )",
             [],
         )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS peers (
+                peer_id TEXT PRIMARY KEY,
+                x25519_pub BLOB NOT NULL,
+                mlkem_pub BLOB NOT NULL,
+                signature BLOB NOT NULL
+            )",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
     pub fn save_message(&self, msg: &DagMessage) -> Result<()> {
         let parents_json = serde_json::to_string(&msg.parents).unwrap_or_default();
-        // INSERT OR IGNORE means if we receive a message we already have, we safely drop it
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (id, author, parents, content) VALUES (?1, ?2, ?3, ?4)",
             (&msg.id, &msg.author, &parents_json, &msg.content),
@@ -68,13 +74,29 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_all_messages(&self) -> Result<Vec<DagMessage>> {
-        let mut stmt = self.conn.prepare("SELECT id, author, parents, content FROM messages ORDER BY rowid ASC")?;
-        
-        let msg_iter = stmt.query_map([], |row| {
+    pub fn save_peer_keys(&self, peer_id: &str, x25519_pub: &[u8], mlkem_pub: &[u8], signature: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO peers (peer_id, x25519_pub, mlkem_pub, signature) VALUES (?1, ?2, ?3, ?4)",
+            (peer_id, x25519_pub, mlkem_pub, signature),
+        )?;
+        Ok(())
+    }
+
+    pub fn get_peer_keys(&self, peer_id: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare("SELECT x25519_pub, mlkem_pub FROM peers WHERE peer_id = ?1")?;
+        let mut rows = stmt.query([peer_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_recent_messages(&self, limit: u32) -> Result<Vec<DagMessage>> {
+        let mut stmt = self.conn.prepare("SELECT id, author, parents, content FROM messages ORDER BY rowid DESC LIMIT ?1")?;
+        let msg_iter = stmt.query_map([limit], |row| {
             let parents_json: String = row.get(2)?;
             let parents: Vec<String> = serde_json::from_str(&parents_json).unwrap_or_default();
-            
             Ok(DagMessage {
                 id: row.get(0)?,
                 author: row.get(1)?,
@@ -87,10 +109,10 @@ impl Store {
         for msg in msg_iter {
             messages.push(msg?);
         }
+        messages.reverse();
         Ok(messages)
     }
 
-    // Add this inside `impl Store` in src/store.rs
     pub fn get_messages_after(&self, known_leaves: &[String]) -> Result<Vec<DagMessage>> {
         let mut start_rowid: i64 = 0;
         
@@ -100,7 +122,6 @@ impl Store {
             let mut stmt = self.conn.prepare(&query)?;
             let params = rusqlite::params_from_iter(known_leaves);
             
-            // FIX: If hash isn't found, abort the massive dump instead of defaulting to 0
             start_rowid = match stmt.query_row(params, |row| row.get::<_, i64>(0)) {
                 Ok(id) => id,
                 Err(_) => return Ok(vec![]), 
@@ -128,7 +149,6 @@ impl Store {
         Ok(messages)
     }
 
-    // To add a new message, we need to know the ID of the most recent message(s) to link to.
     pub fn get_latest_leaves(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT id FROM messages ORDER BY rowid DESC LIMIT 1")?;
         let mut rows = stmt.query([])?;
