@@ -154,7 +154,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     
-    // --- THE NEW STARTUP MESSAGE ---
     println!("\n[SYSTEM] Network Engine is now ONLINE and ready to rock! 🚀");
     println!("[SYSTEM] Type a message to broadcast, or type /invite to connect to peers.\n");
 
@@ -279,7 +278,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Identify(identify::Event::Received { peer_id, info })) => {
                     let observed_ip = info.observed_addr.clone();
-                    if !listen_addrs.contains(&observed_ip) {
+                    
+                    // FIX: Stop the ephemeral port explosion caused by Symmetric NAT.
+                    // We cap the list at 6 total listen addresses so it doesn't flood the /invite menu.
+                    if !listen_addrs.contains(&observed_ip) && listen_addrs.len() < 6 {
                         listen_addrs.push(observed_ip.clone());
                         let _ = swarm.add_external_address(observed_ip);
                     }
@@ -314,7 +316,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(peer) = peer_id {
                         let err_str = format!("{:?}", error);
                         
-                        // Aggressive noise filter for background DHT drops
                         let is_noise = err_str.contains("Timeout") || 
                                        err_str.contains("HandshakeTimedOut") ||
                                        err_str.contains("Connection refused") ||
@@ -328,7 +329,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                        err_str.contains("No matching records found") ||
                                        err_str.contains("error: Failed");
                         
-                        // Only print if it bypassed the noise filter
                         if !is_noise {
                             println!("[ERROR] Failed to dial {}: {:?}", peer, error);
                         }
@@ -338,13 +338,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 SwarmEvent::NewListenAddr { address, .. } => {
-                    if !listen_addrs.contains(&address) {
+                    if !listen_addrs.contains(&address) && listen_addrs.len() < 6 {
                         listen_addrs.push(address);
                     }
                 }
                 
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                    // SILENCED: Standard IPFS background connections
                     match endpoint {
                         libp2p::core::ConnectedPoint::Dialer { address, .. } => {
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, address.clone());
@@ -359,7 +358,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
                     let signature = local_key.sign(&payload_to_sign).unwrap();
 
-                    // SILENTLY initiate KEX. Project Swarm nodes will answer.
                     swarm.behaviour_mut().kex.send_request(
                         &peer_id,
                         KexRequest {
