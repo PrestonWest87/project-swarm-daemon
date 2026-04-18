@@ -257,10 +257,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     println!("[NETWORK] Secure tunnel established with {}", peer_id);
-                    if endpoint.is_dialer() {
-                        swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    
+                    match endpoint {
+                        libp2p::core::ConnectedPoint::Dialer { address, .. } => {
+                            swarm.behaviour_mut().kademlia.add_address(&peer_id, address.clone());
+                        }
+                        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
+                            swarm.behaviour_mut().kademlia.add_address(&peer_id, send_back_addr.clone());
+                        }
                     }
+                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
 
                     let mut payload_to_sign = my_crypto_id.x25519_public.to_bytes().to_vec();
                     payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
@@ -344,37 +350,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     else if let Ok(dag_msg) = serde_json::from_slice::<DagMessage>(&message.data) {
                         let db_clone = Arc::clone(&db);
                         tokio::task::spawn_blocking(move || {
-                            // 1. Save to the database
                             let _ = db_clone.lock().unwrap().save_message(&dag_msg);
-                            // 2. Print it to the console while we still own it inside the closure
                             println!("[{}] (Hash: {}): {}", &dag_msg.author[..8], &dag_msg.id[..8], dag_msg.content);
                         }).await.unwrap();
                     }
                 }
                 
-                SwarmEvent::Behaviour(SwarmProtocolEvent::ReqRes(request_response::Event::Message { peer, message })) => match message {
-                    request_response::Message::Request { request, channel, .. } => {
-                        let db_clone = Arc::clone(&db);
-                        let missing = tokio::task::spawn_blocking(move || {
-                            db_clone.lock().unwrap().get_messages_after(&request.known_leaves).unwrap_or_default()
-                        }).await.unwrap();
-                        
-                        let _ = swarm.behaviour_mut().req_res.send_response(
-                            channel,
-                            sync::SyncResponse { missing_messages: missing }
-                        );
-                    }
-                    request_response::Message::Response { response, .. } => {
-                        if !response.missing_messages.is_empty() {
-                            println!("[SYNC] Received {} missing messages from {}", response.missing_messages.len(), peer);
+                SwarmEvent::Behaviour(SwarmProtocolEvent::ReqRes(event)) => match event {
+                    request_response::Event::Message { peer, message } => match message {
+                        request_response::Message::Request { request, channel, .. } => {
                             let db_clone = Arc::clone(&db);
-                            tokio::task::spawn_blocking(move || {
-                                let lock = db_clone.lock().unwrap();
-                                for msg in response.missing_messages {
-                                    let _ = lock.save_message(&msg);
-                                }
+                            let missing = tokio::task::spawn_blocking(move || {
+                                db_clone.lock().unwrap().get_messages_after(&request.known_leaves).unwrap_or_default()
                             }).await.unwrap();
+                            
+                            let _ = swarm.behaviour_mut().req_res.send_response(
+                                channel,
+                                sync::SyncResponse { missing_messages: missing }
+                            );
                         }
+                        request_response::Message::Response { response, .. } => {
+                            if !response.missing_messages.is_empty() {
+                                println!("[SYNC] Received {} missing messages from {}", response.missing_messages.len(), peer);
+                                let db_clone = Arc::clone(&db);
+                                tokio::task::spawn_blocking(move || {
+                                    let lock = db_clone.lock().unwrap();
+                                    for msg in response.missing_messages {
+                                        let _ = lock.save_message(&msg);
+                                    }
+                                }).await.unwrap();
+                            } else {
+                                println!("[SYNC] Up to date with {}", peer);
+                            }
+                        }
+                    },
+                    request_response::Event::OutboundFailure { peer, error, .. } => {
+                        println!("[SYNC ERROR] Outbound payload to {} failed: {:?}", peer, error);
+                    },
+                    request_response::Event::InboundFailure { peer, error, .. } => {
+                        println!("[SYNC ERROR] Inbound payload from {} failed: {:?}", peer, error);
+                    },
+                    request_response::Event::ResponseSent { peer, .. } => {
+                        println!("[SYNC] Database state successfully transmitted to {}", peer);
                     }
                 }
                 _ => {}
