@@ -133,7 +133,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     for node in BOOTSTRAP_NODES {
         if let Ok(addr) = node.parse::<Multiaddr>() {
-            println!("[NETWORK] Dialing public bootstrap relay: {}", addr);
             let _ = swarm.dial(addr.clone());
         }
     }
@@ -261,32 +260,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             
             event = swarm.select_next_some() => match event {
-                // STUN verification: Learns the public IP from bootstrap nodes and registers it
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Identify(identify::Event::Received { peer_id, info })) => {
                     let observed_ip = info.observed_addr.clone();
                     if !listen_addrs.contains(&observed_ip) {
                         listen_addrs.push(observed_ip.clone());
-                        let _ = swarm.add_external_address(observed_ip); // Publishes our IP to the global mesh
+                        let _ = swarm.add_external_address(observed_ip);
                     }
                     for addr in info.listen_addrs {
                         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                     }
                 }
 
-                // Local Network Discovery Fallback
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer, addr) in list {
                         swarm.behaviour_mut().kademlia.add_address(&peer, addr);
                     }
                 }
 
-                // Waits for Kademlia to find the target's IP, then triggers the dial
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
                     result: kad::QueryResult::GetClosestPeers(Ok(ok)), .. 
                 })) => {
                     for peer in ok.peers {
                         if pending_dials.contains(&peer) {
-                            // Only dial if the background process hasn't already connected us!
                             if !swarm.is_connected(&peer) {
                                 println!("[NETWORK] DHT located {}. Initiating connection...", peer);
                                 if let Err(e) = swarm.dial(peer) {
@@ -300,25 +295,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     if let Some(peer) = peer_id {
-                        let error_str = format!("{:?}", error);
+                        let err_str = format!("{:?}", error);
                         
-                        // 1. Filter out DHT loopback reflection noise
-                        let is_loopback = error_str.contains("127.0.0.1") && error_str.contains("WrongPeerId");
+                        // Aggressive noise filter for background DHT drops
+                        let is_noise = err_str.contains("Timeout") || 
+                                       err_str.contains("HandshakeTimedOut") ||
+                                       err_str.contains("Connection refused") ||
+                                       err_str.contains("ConnectionReset") ||
+                                       err_str.contains("ConnectionClosed") ||
+                                       err_str.contains("NetworkUnreachable") ||
+                                       err_str.contains("HostUnreachable") ||
+                                       err_str.contains("MultiaddrNotSupported") ||
+                                       err_str.contains("UnexpectedEof") ||
+                                       err_str.contains("WrongPeerId") ||
+                                       err_str.contains("No matching records found");
                         
-                        // 2. Filter out unsupported browser transports (WebRTC/WebTransport)
-                        let is_unsupported = error_str.contains("MultiaddrNotSupported");
-                        
-                        // 3. Filter out standard offline node noise and IPv6 unreachable OS errors
-                        let is_offline = error_str.contains("Timeout") || 
-                                         error_str.contains("ConnectionReset") || 
-                                         error_str.contains("Connection refused") ||
-                                         error_str.contains("No matching records found") ||
-                                         error_str.contains("NetworkUnreachable"); // <--- Added this to catch IPv6 drops
-                        
-                        // Only print legitimate, unexpected network failures
-                        //if !is_loopback && !is_unsupported && !is_offline {
+                        // Only print if it bypassed the noise filter
+                        if !is_noise {
                             println!("[ERROR] Failed to dial {}: {:?}", peer, error);
-                        //}
+                        }
                         
                         pending_dials.remove(&peer);
                     }
@@ -331,7 +326,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                    
+                    // SILENCED: Standard IPFS background connections
                     match endpoint {
                         libp2p::core::ConnectedPoint::Dialer { address, .. } => {
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, address.clone());
@@ -346,6 +341,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
                     let signature = local_key.sign(&payload_to_sign).unwrap();
 
+                    // SILENTLY initiate KEX. Project Swarm nodes will answer.
                     swarm.behaviour_mut().kex.send_request(
                         &peer_id,
                         KexRequest {
@@ -363,7 +359,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         
                         let pub_key = libp2p::identity::PublicKey::try_decode_protobuf(&peer.to_bytes()[2..]).unwrap();
                         if !pub_key.verify(&verify_payload, &request.signature) {
-                            println!("[SECURITY] Critical: KEX Signature verification failed for {}!", peer);
                             continue;
                         }
 
@@ -395,7 +390,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         
                         let pub_key = libp2p::identity::PublicKey::try_decode_protobuf(&peer.to_bytes()[2..]).unwrap();
                         if !pub_key.verify(&verify_payload, &response.signature) {
-                            println!("[SECURITY] Critical: KEX Signature verification failed for {}!", peer);
                             continue;
                         }
 
@@ -452,20 +446,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         let _ = lock.save_message(&msg);
                                     }
                                 }).await.unwrap();
-                            } else {
-                                println!("[SYNC] Up to date with {}", peer);
                             }
                         }
                     },
-                    request_response::Event::OutboundFailure { peer, error, .. } => {
-                        println!("[SYNC ERROR] Outbound payload to {} failed: {:?}", peer, error);
-                    },
-                    request_response::Event::InboundFailure { peer, error, .. } => {
-                        println!("[SYNC ERROR] Inbound payload from {} failed: {:?}", peer, error);
-                    },
-                    request_response::Event::ResponseSent { peer, .. } => {
-                        println!("[SYNC] Database state successfully transmitted to {}", peer);
-                    }
+                    _ => {} // SILENCED background sync drops
                 }
                 _ => {}
             }
