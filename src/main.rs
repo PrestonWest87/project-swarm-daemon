@@ -265,7 +265,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Identify(identify::Event::Received { peer_id, info })) => {
                     let observed_ip = info.observed_addr.clone();
                     if !listen_addrs.contains(&observed_ip) {
-                        println!("[NETWORK] External IP verified via STUN: {}", observed_ip);
                         listen_addrs.push(observed_ip.clone());
                         let _ = swarm.add_external_address(observed_ip); // Publishes our IP to the global mesh
                     }
@@ -332,7 +331,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                    println!("[NETWORK] Secure tunnel established with {}", peer_id);
                     
                     match endpoint {
                         libp2p::core::ConnectedPoint::Dialer { address, .. } => {
@@ -348,7 +346,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
                     let signature = local_key.sign(&payload_to_sign).unwrap();
 
-                    println!("[SECURITY] Initiating Authenticated PQ Key Exchange with {}...", peer_id);
                     swarm.behaviour_mut().kex.send_request(
                         &peer_id,
                         KexRequest {
