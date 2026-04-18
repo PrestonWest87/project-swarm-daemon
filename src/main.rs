@@ -11,6 +11,7 @@ use libp2p::{
     identity, PeerId, Multiaddr, tcp, noise, yamux
 };
 use pqcrypto_traits::kem::PublicKey;
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
@@ -142,6 +143,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[SYSTEM] Network Engine Online. Type a message to broadcast.");
 
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
+    let mut pending_dials: HashSet<PeerId> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -152,18 +154,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if input.starts_with("/connect ") {
                     let target = input.strip_prefix("/connect ").unwrap().trim();
                     
-                    // Route A: Try parsing as a direct Multiaddr (IP-based)
                     if let Ok(addr) = target.parse::<Multiaddr>() {
                         println!("[NETWORK] Dialing direct Multiaddr {}...", addr);
                         let _ = swarm.dial(addr);
                     } 
-                    // Route B: Try parsing as a raw PeerId (IP-less DHT Routing)
                     else if let Ok(peer) = target.parse::<PeerId>() {
                         println!("[NETWORK] Searching Global DHT for Peer {}...", peer);
-                        // Force the Kademlia DHT to search the network for this specific peer's IPs
                         swarm.behaviour_mut().kademlia.get_closest_peers(peer);
-                        // Queue the dial. Libp2p will automatically connect once Kademlia finds the route!
-                        let _ = swarm.dial(peer);
+                        pending_dials.insert(peer);
                     } 
                     else {
                         println!("[ERROR] Invalid address or PeerId format.");
@@ -263,6 +261,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             
             event = swarm.select_next_some() => match event {
+                // STUN verification: Learns the public IP from bootstrap nodes and registers it
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Identify(identify::Event::Received { peer_id, info })) => {
+                    let observed_ip = info.observed_addr.clone();
+                    if !listen_addrs.contains(&observed_ip) {
+                        println!("[NETWORK] External IP verified via STUN: {}", observed_ip);
+                        listen_addrs.push(observed_ip.clone());
+                        let _ = swarm.add_external_address(observed_ip); // Publishes our IP to the global mesh
+                    }
+                    for addr in info.listen_addrs {
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    }
+                }
+
+                // Local Network Discovery Fallback
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Mdns(mdns::Event::Discovered(list))) => {
+                    for (peer, addr) in list {
+                        swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+                    }
+                }
+
+                // Waits for Kademlia to find the target's IP, then triggers the dial
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
+                    result: kad::QueryResult::GetClosestPeers(Ok(ok)), .. 
+                })) => {
+                    for peer in ok.peers {
+                        if pending_dials.contains(&peer) {
+                            println!("[NETWORK] DHT located {}. Initiating connection...", peer);
+                            if let Err(e) = swarm.dial(peer) {
+                                println!("[ERROR] Dial failed immediately: {:?}", e);
+                            }
+                            pending_dials.remove(&peer);
+                        }
+                    }
+                }
+
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    if let Some(peer) = peer_id {
+                        println!("[ERROR] Failed to dial {}: {:?}", peer, error);
+                        pending_dials.remove(&peer);
+                    }
+                }
+
                 SwarmEvent::NewListenAddr { address, .. } => {
                     if !listen_addrs.contains(&address) {
                         listen_addrs.push(address);
