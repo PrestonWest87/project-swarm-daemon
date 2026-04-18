@@ -287,9 +287,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 })) => {
                     for peer in ok.peers {
                         if pending_dials.contains(&peer) {
-                            println!("[NETWORK] DHT located {}. Initiating connection...", peer);
-                            if let Err(e) = swarm.dial(peer) {
-                                println!("[ERROR] Dial failed immediately: {:?}", e);
+                            // Only dial if the background process hasn't already connected us!
+                            if !swarm.is_connected(&peer) {
+                                println!("[NETWORK] DHT located {}. Initiating connection...", peer);
+                                if let Err(e) = swarm.dial(peer) {
+                                    println!("[ERROR] Dial failed: {:?}", e);
+                                }
                             }
                             pending_dials.remove(&peer);
                         }
@@ -300,12 +303,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(peer) = peer_id {
                         let error_str = format!("{:?}", error);
                         
-                        // Filter out DHT loopback reflection noise
-                        let is_loopback_reflection = error_str.contains("127.0.0.1") && error_str.contains("WrongPeerId");
+                        // 1. Filter out DHT loopback reflection noise
+                        let is_loopback = error_str.contains("127.0.0.1") && error_str.contains("WrongPeerId");
                         
-                        if !is_loopback_reflection {
+                        // 2. Filter out unsupported browser transports (WebRTC/WebTransport)
+                        let is_unsupported = error_str.contains("MultiaddrNotSupported");
+                        
+                        // 3. Filter out standard offline node noise and IPv6 unreachable OS errors
+                        let is_offline = error_str.contains("Timeout") || 
+                                         error_str.contains("ConnectionReset") || 
+                                         error_str.contains("Connection refused") ||
+                                         error_str.contains("No matching records found") ||
+                                         error_str.contains("NetworkUnreachable"); // <--- Added this to catch IPv6 drops
+                        
+                        // Only print legitimate, unexpected network failures
+                        //if !is_loopback && !is_unsupported && !is_offline {
                             println!("[ERROR] Failed to dial {}: {:?}", peer, error);
-                        }
+                        //}
                         
                         pending_dials.remove(&peer);
                     }
