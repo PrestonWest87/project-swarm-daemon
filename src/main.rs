@@ -298,7 +298,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     if let Some(peer) = peer_id {
-                        println!("[ERROR] Failed to dial {}: {:?}", peer, error);
+                        let error_str = format!("{:?}", error);
+                        
+                        // Filter out DHT loopback reflection noise
+                        let is_loopback_reflection = error_str.contains("127.0.0.1") && error_str.contains("WrongPeerId");
+                        
+                        if !is_loopback_reflection {
+                            println!("[ERROR] Failed to dial {}: {:?}", peer, error);
+                        }
+                        
                         pending_dials.remove(&peer);
                     }
                 }
