@@ -50,7 +50,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[SYSTEM] Generating Hybrid X25519 + ML-KEM Cryptographic Keys...");
     let my_crypto_id = crypto::HybridIdentity::generate();
     
-    let local_key = identity::Keypair::generate_ed25519();
+    // --- IDENTITY PERSISTENCE ---
+    let key_path = "swarm_network_key.bin";
+    let local_key = match std::fs::read(key_path) {
+        Ok(bytes) => {
+            println!("[SYSTEM] Loading existing network identity from disk...");
+            identity::Keypair::from_protobuf_encoding(&bytes).expect("Valid identity file")
+        }
+        Err(_) => {
+            println!("[SYSTEM] Generating NEW network identity...");
+            let new_key = identity::Keypair::generate_ed25519();
+            std::fs::write(key_path, new_key.to_protobuf_encoding().unwrap()).expect("Failed to save key");
+            new_key
+        }
+    };
+    
     let local_peer_id = PeerId::from(local_key.public());
     let local_author_id = local_peer_id.to_string();
     println!("[SYSTEM] Quantum-resistant identity secured. Node ID: {}", local_peer_id);
@@ -139,7 +153,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = swarm.behaviour_mut().kademlia.bootstrap();
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
-    println!("[SYSTEM] Network Engine Online. Type a message to broadcast.");
+    
+    // --- THE NEW STARTUP MESSAGE ---
+    println!("\n[SYSTEM] Network Engine is now ONLINE and ready to rock! 🚀");
+    println!("[SYSTEM] Type a message to broadcast, or type /invite to connect to peers.\n");
 
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
     let mut pending_dials: HashSet<PeerId> = HashSet::new();
@@ -308,7 +325,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                        err_str.contains("MultiaddrNotSupported") ||
                                        err_str.contains("UnexpectedEof") ||
                                        err_str.contains("WrongPeerId") ||
-                                       err_str.contains("No matching records found");
+                                       err_str.contains("No matching records found") ||
+                                       err_str.contains("error: Failed");
                         
                         // Only print if it bypassed the noise filter
                         if !is_noise {
