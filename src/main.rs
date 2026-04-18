@@ -150,19 +150,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if input.is_empty() { continue; }
 
                 if input.starts_with("/connect ") {
-                    let addr_str = input.strip_prefix("/connect ").unwrap().trim();
-                    match addr_str.parse::<Multiaddr>() {
-                        Ok(addr) => {
-                            println!("[NETWORK] Dialing out to {}...", addr);
-                            let _ = swarm.dial(addr);
-                        }
-                        Err(e) => println!("[ERROR] Invalid address format: {}", e),
+                    let target = input.strip_prefix("/connect ").unwrap().trim();
+                    
+                    // Route A: Try parsing as a direct Multiaddr (IP-based)
+                    if let Ok(addr) = target.parse::<Multiaddr>() {
+                        println!("[NETWORK] Dialing direct Multiaddr {}...", addr);
+                        let _ = swarm.dial(addr);
+                    } 
+                    // Route B: Try parsing as a raw PeerId (IP-less DHT Routing)
+                    else if let Ok(peer) = target.parse::<PeerId>() {
+                        println!("[NETWORK] Searching Global DHT for Peer {}...", peer);
+                        // Force the Kademlia DHT to search the network for this specific peer's IPs
+                        swarm.behaviour_mut().kademlia.get_closest_peers(peer);
+                        // Queue the dial. Libp2p will automatically connect once Kademlia finds the route!
+                        let _ = swarm.dial(peer);
+                    } 
+                    else {
+                        println!("[ERROR] Invalid address or PeerId format.");
                     }
                     continue;
                 }
 
                 if input == "/invite" {
                     println!("--- YOUR MAGIC INVITE LINKS ---");
+                    println!("🌐 Global DHT Invite (No IP Required):");
+                    println!("/connect {}", local_peer_id);
+                    
+                    println!("\n📡 Direct IP Fallbacks:");
                     for addr in &listen_addrs {
                         let addr_str = addr.to_string();
                         if addr_str.contains("/127.0.0.1/") || 
