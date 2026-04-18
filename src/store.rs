@@ -94,18 +94,19 @@ impl Store {
     pub fn get_messages_after(&self, known_leaves: &[String]) -> Result<Vec<DagMessage>> {
         let mut start_rowid: i64 = 0;
         
-        // If they gave us leaves, find the row ID of the most recent one they know about
         if !known_leaves.is_empty() {
             let placeholders = known_leaves.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let query = format!("SELECT MAX(rowid) FROM messages WHERE id IN ({})", placeholders);
             let mut stmt = self.conn.prepare(&query)?;
             let params = rusqlite::params_from_iter(known_leaves);
             
-            // If we don't find their hash (maybe they are on a different fork), default to 0 (sync everything)
-            start_rowid = stmt.query_row(params, |row| row.get(0)).unwrap_or(0);
+            // FIX: If hash isn't found, abort the massive dump instead of defaulting to 0
+            start_rowid = match stmt.query_row(params, |row| row.get::<_, i64>(0)) {
+                Ok(id) => id,
+                Err(_) => return Ok(vec![]), 
+            };
         }
 
-        // Fetch everything after that row ID
         let mut stmt = self.conn.prepare("SELECT id, author, parents, content FROM messages WHERE rowid > ?1 ORDER BY rowid ASC")?;
         
         let msg_iter = stmt.query_map([start_rowid], |row| {

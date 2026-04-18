@@ -7,10 +7,12 @@ pub const KEX_PROTOCOL_NAME: StreamProtocol = StreamProtocol::new("/project-swar
 pub struct KexRequest {
     pub x25519_pub: Vec<u8>,
     pub mlkem_pub: Vec<u8>,
+    pub signature: Vec<u8>, // Ed25519 signature of the keys
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KexResponse {
     pub x25519_pub: Vec<u8>,
     pub mlkem_pub: Vec<u8>,
+    pub signature: Vec<u8>, // Ed25519 signature of the keys
 }

@@ -6,7 +6,6 @@ use chacha20poly1305::{aead::{Aead, AeadCore, KeyInit}, ChaCha20Poly1305, Key, N
 use hkdf::Hkdf;
 use sha2::Sha256;
 use rand_core::OsRng as RandOsRng;
-use crate::kex::{KexRequest, KexResponse};
 
 pub struct HybridIdentity {
     pub x25519_secret: StaticSecret,
@@ -28,6 +27,7 @@ impl HybridIdentity {
             mlkem_public,
         }
     }
+}
 
     pub fn to_kex_request(&self) -> KexRequest {
         KexRequest {
