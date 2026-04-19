@@ -10,7 +10,6 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     identity, PeerId, Multiaddr, tcp, noise, yamux
 };
-use libp2p::multiaddr::Protocol;
 use pqcrypto_traits::kem::PublicKey;
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -156,7 +155,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = swarm.behaviour_mut().kademlia.bootstrap();
 
     // 2. The Rendezvous Key (Our version of a BitTorrent Infohash)
-    let rendezvous_key = kad::RecordKey::new(&b"project-swarm-rendezvous-v1"[..]);
+    let rendezvous_key = kad::RecordKey::new(&b"project-swarm-rendezvous-v1");
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     
@@ -292,9 +291,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // [NEW] Handling the response from /discover
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
-                    result: kad::QueryResult::GetProviders(Ok(ok)), .. 
+                    result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })), .. 
                 })) => {
-                    for provider in ok.providers {
+                    for provider in providers {
                         if provider != local_peer_id && !swarm.is_connected(&provider) {
                             println!("[NETWORK] 🎯 Found Swarm Node on DHT: {}. Negotiating connection...", provider);
                             let _ = swarm.dial(provider);
