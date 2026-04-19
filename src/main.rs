@@ -137,14 +137,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
-        .with_quic()
+        .with_quic() // UDP hole-punching support
         .with_dns()? 
         .with_behaviour(|_| behaviour)?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
     let static_port = 4001;
+    // Primary: Listen on QUIC (UDP)
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", static_port).parse()?)?;
+    // Fallback: Listen on TCP
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", static_port).parse()?)?;
 
     println!("[NETWORK] Bootstrapping to global P2P infrastructure...");
@@ -174,7 +176,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let input = line.trim();
                 if input.is_empty() { continue; }
 
-                // [NEW] Secure Room Invite Generation
                 if input == "/invite" {
                     let mut rng_bytes = [0u8; 4];
                     rand_core::OsRng.fill_bytes(&mut rng_bytes);
@@ -200,7 +201,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
 
-                // [NEW] Join a Specific Chat Hash
                 if input.starts_with("/join ") {
                     let target_room = input.strip_prefix("/join ").unwrap().trim().to_string();
                     
@@ -335,6 +335,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let _ = swarm.behaviour_mut().kademlia.start_providing(rendezvous_key.clone().into());
                         is_providing = true;
                     }
+
+                    // WAIT for Identify to confirm protocol support before initiating the Kex Handshake
+                    if info.protocols.contains(&kex::KEX_PROTOCOL_NAME) {
+                        let mut payload_to_sign = my_crypto_id.x25519_public.to_bytes().to_vec();
+                        payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
+                        let signature = local_key.sign(&payload_to_sign).unwrap();
+
+                        swarm.behaviour_mut().kex.send_request(
+                            &peer_id,
+                            KexRequest {
+                                x25519_pub: my_crypto_id.x25519_public.to_bytes().to_vec(),
+                                mlkem_pub: my_crypto_id.mlkem_public.as_bytes().to_vec(),
+                                signature,
+                            }
+                        );
+                    }
                 }
 
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
@@ -395,19 +411,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-
-                    let mut payload_to_sign = my_crypto_id.x25519_public.to_bytes().to_vec();
-                    payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
-                    let signature = local_key.sign(&payload_to_sign).unwrap();
-
-                    swarm.behaviour_mut().kex.send_request(
-                        &peer_id,
-                        KexRequest {
-                            x25519_pub: my_crypto_id.x25519_public.to_bytes().to_vec(),
-                            mlkem_pub: my_crypto_id.mlkem_public.as_bytes().to_vec(),
-                            signature,
-                        }
-                    );
+                    // Kex Handshake removed from here, successfully relocated to Identify logic above.
                 }
 
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Kex(request_response::Event::Message { peer, message })) => match message {
@@ -437,7 +441,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             signature,
                         });
 
-                        // [NEW] Connection Success Message
                         println!("[SYSTEM] 🟢 Secure connection to {} fully established and verified. Ready to chat!", peer);
 
                         let known_leaves = db.lock().unwrap().get_latest_leaves().unwrap_or_default();
@@ -458,7 +461,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = db_clone.lock().unwrap().save_peer_keys(&peer_str, &response.x25519_pub, &response.mlkem_pub, &response.signature);
                         }).await.unwrap();
 
-                        // [NEW] Connection Success Message
                         println!("[SYSTEM] 🟢 Secure connection to {} fully established and verified. Ready to chat!", peer);
 
                         let known_leaves = db.lock().unwrap().get_latest_leaves().unwrap_or_default();
