@@ -22,8 +22,7 @@ use rand_core::RngCore;
 
 // Added tracing imports for the firehose log file
 use tracing::{info, debug, warn, error, trace};
-use tracing_subscriber::{fmt, EnvFilter};
-
+use tracing_subscriber::EnvFilter;
 use store::{DagMessage, Store};
 use kex::{KexRequest, KexResponse, KEX_PROTOCOL_NAME};
 
@@ -534,8 +533,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         tokio::task::spawn_blocking(move || {
                             let _ = db_clone.lock().unwrap().save_message(&dag_msg);
                             println!("[{}] (Hash: {}): {}", &dag_msg.author[..8], &dag_msg.id[..8], dag_msg.content);
+                            // Move the debug log INSIDE the closure while it still owns dag_msg
+                            debug!("Processed incoming Gossipsub DAG message: {}", dag_msg.id);
                         }).await.unwrap();
-                        debug!("Processed incoming Gossipsub DAG message: {}", dag_msg.id);
                     }
                 }
                 
