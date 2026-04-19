@@ -290,17 +290,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                // [NEW] Handling the response from /discover
-                SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
-                    result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })), .. 
-                })) => {
-                    for provider in providers {
-                        if provider != local_peer_id && !swarm.is_connected(&provider) {
-                            println!("[NETWORK] 🎯 Found Swarm Node on DHT: {}. Negotiating connection...", provider);
-                            let _ = swarm.dial(provider);
-                        }
-                    }
-                }
 
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
                     result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })), .. 
