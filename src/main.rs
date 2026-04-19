@@ -18,11 +18,11 @@ use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use tokio::io::{self, AsyncBufReadExt};
+use rand_core::RngCore;
 
 use store::{DagMessage, Store};
 use kex::{KexRequest, KexResponse, KEX_PROTOCOL_NAME};
 
-// Public DHT backbone nodes (Used strictly for peer discovery and STUN/Relay negotiation)
 const BOOTSTRAP_NODES: &[&str] = &[
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXBPxW8V92uMb",
@@ -87,8 +87,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         gossipsub_config,
     ).expect("Valid gossipsub setup");
 
-    let topic = gossipsub::IdentTopic::new("swarm-alpha");
-    gossipsub_behaviour.subscribe(&topic).unwrap();
+    // We start in the global alpha room by default
+    let mut current_topic = "swarm-alpha".to_string();
+    let initial_topic = gossipsub::IdentTopic::new(current_topic.clone());
+    gossipsub_behaviour.subscribe(&initial_topic).unwrap();
 
     let mdns_behaviour = mdns::tokio::Behaviour::new(
         mdns::Config::default(), 
@@ -145,7 +147,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", static_port).parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", static_port).parse()?)?;
 
-    // 1. Connect to the public backbone to access the DHT
     println!("[NETWORK] Bootstrapping to global P2P infrastructure...");
     for node in BOOTSTRAP_NODES {
         if let Ok(addr) = node.parse::<Multiaddr>() {
@@ -154,19 +155,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let _ = swarm.behaviour_mut().kademlia.bootstrap();
 
-    // 2. The Rendezvous Key (Our version of a BitTorrent Infohash)
     let rendezvous_key = kad::RecordKey::new(&b"project-swarm-rendezvous-v1");
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     
     println!("\n[SYSTEM] Decentralized Mesh Engine ONLINE. 🚀");
     println!("[SYSTEM] Transport & Payloads are end-to-end encrypted.");
-    println!("[SYSTEM] Type /discover to find peers via global DHT.\n");
+    println!("[SYSTEM] Type /invite to create a specific secure chat room.\n");
 
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
     let mut pending_dials: HashSet<PeerId> = HashSet::new();
     let mut is_providing = false;
-    let mut known_providers: HashSet<PeerId> = HashSet::new();
+    let mut known_providers: HashSet<PeerId> = HashSet::new(); 
 
     loop {
         tokio::select! {
@@ -174,9 +174,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let input = line.trim();
                 if input.is_empty() { continue; }
 
-                // [NEW] BitTorrent-style Swarm Discovery
+                // [NEW] Secure Room Invite Generation
+                if input == "/invite" {
+                    let mut rng_bytes = [0u8; 4];
+                    rand_core::OsRng.fill_bytes(&mut rng_bytes);
+                    let room_code = hex::encode(rng_bytes);
+                    let invite_hash = format!("swarm-room-{}", room_code);
+                    
+                    println!("--- YOUR SECURE ROOM INVITE ---");
+                    println!("Give this command to your friend:");
+                    println!("  /join {}", invite_hash);
+                    println!("-------------------------------");
+                    
+                    let old_topic = gossipsub::IdentTopic::new(current_topic.clone());
+                    let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&old_topic);
+                    
+                    current_topic = invite_hash.clone();
+                    let new_topic = gossipsub::IdentTopic::new(current_topic.clone());
+                    let _ = swarm.behaviour_mut().gossipsub.subscribe(&new_topic);
+                    
+                    let room_key = kad::RecordKey::new(&current_topic);
+                    let _ = swarm.behaviour_mut().kademlia.start_providing(room_key.into());
+                    
+                    println!("[SYSTEM] 🟡 You have moved to private room: '{}'. Waiting for peers...", current_topic);
+                    continue;
+                }
+
+                // [NEW] Join a Specific Chat Hash
+                if input.starts_with("/join ") {
+                    let target_room = input.strip_prefix("/join ").unwrap().trim().to_string();
+                    
+                    println!("[NETWORK] Joining private room '{}' and searching DHT...", target_room);
+                    
+                    let old_topic = gossipsub::IdentTopic::new(current_topic.clone());
+                    let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&old_topic);
+                    
+                    current_topic = target_room.clone();
+                    let new_topic = gossipsub::IdentTopic::new(current_topic.clone());
+                    let _ = swarm.behaviour_mut().gossipsub.subscribe(&new_topic);
+                    
+                    let room_key = kad::RecordKey::new(&current_topic);
+                    let _ = swarm.behaviour_mut().kademlia.start_providing(room_key.clone().into());
+                    swarm.behaviour_mut().kademlia.get_providers(room_key);
+                    
+                    continue;
+                }
+
                 if input == "/discover" {
-                    println!("[NETWORK] Querying Global DHT for nodes providing 'project-swarm-rendezvous-v1'...");
+                    println!("[NETWORK] Querying Global DHT for public swarm nodes...");
                     swarm.behaviour_mut().kademlia.get_providers(rendezvous_key.clone());
                     continue;
                 }
@@ -230,8 +275,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &mlkem_pub
                                 ) {
                                     let payload = serde_json::to_vec(&bundle).unwrap();
-                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload);
-                                    println!("[SYSTEM] ML-KEM encrypted whisper sent to {}.", target_peer);
+                                    let topic_to_publish = gossipsub::IdentTopic::new(current_topic.clone());
+                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic_to_publish, payload);
+                                    println!("[BROADCAST] 🟢 ML-KEM encrypted whisper sent to {}.", target_peer);
                                 }
                             } else {
                                 println!("[ERROR] Public keys for {} not found in database.", target_peer);
@@ -248,7 +294,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let db_clone = Arc::clone(&db);
                 let local_author_clone = local_author_id.clone();
                 let input_clone = input.to_string();
-                let topic_clone = topic.clone();
+                let topic_to_publish = gossipsub::IdentTopic::new(current_topic.clone());
                 
                 let parents = tokio::task::spawn_blocking(move || {
                     let lock = db_clone.lock().unwrap();
@@ -259,15 +305,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }).await.unwrap();
 
                 let payload = serde_json::to_vec(&parents).unwrap();
-                match swarm.behaviour_mut().gossipsub.publish(topic_clone, payload) {
-                    Ok(_) => {} 
-                    Err(gossipsub::PublishError::InsufficientPeers) => println!("[SYSTEM] (Saved locally. Will sync.)"),
-                    Err(e) => println!("[ERROR] Publish error: {e:?}"),
+                match swarm.behaviour_mut().gossipsub.publish(topic_to_publish, payload) {
+                    Ok(_) => {
+                        println!("[BROADCAST] 🟢 Message (Hash: {}) successfully encrypted and sent to channel.", &parents.id[..8]);
+                    } 
+                    Err(gossipsub::PublishError::InsufficientPeers) => {
+                        println!("[SYSTEM] 🟡 No active peers in room. (Message Hash: {} saved locally. Will sync upon connection.)", &parents.id[..8]);
+                    }
+                    Err(e) => println!("[ERROR] 🔴 Publish error: {e:?}"),
                 }
             }
             
             event = swarm.select_next_some() => match event {
-                // [NEW] DCUtR Hole Punch Notification
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Dcutr(event)) => {
                     println!("[NETWORK] 🥊 DCUtR Hole Punch Event: {:?}. Connection Commandeered!", event);
                 },
@@ -282,26 +331,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                     }
                     
-                    // Once we establish identity with the DHT, start providing the rendezvous hash
                     if !is_providing {
                         let _ = swarm.behaviour_mut().kademlia.start_providing(rendezvous_key.clone().into());
                         is_providing = true;
-                        println!("[NETWORK] Broadcasting presence to the DHT swarm hash...");
                     }
                 }
-
 
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
                     result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })), .. 
                 })) => {
                     for provider in providers {
                         if provider != local_peer_id && !swarm.is_connected(&provider) {
-                            // [FIX] Only print and dial if we haven't seen them yet this session
                             if known_providers.insert(provider) {
-                                println!("[NETWORK] 🎯 Found Swarm Node on DHT: {}. Negotiating connection...", provider);
+                                println!("[NETWORK] 🎯 Found Peer on DHT: {}. Negotiating connection...", provider);
                                 let _ = swarm.dial(provider);
                                 pending_dials.insert(provider);
                             }
+                        }
+                    }
+                }
+
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
+                    result: kad::QueryResult::GetClosestPeers(Ok(ok)), .. 
+                })) => {
+                    for peer in ok.peers {
+                        if pending_dials.contains(&peer) {
+                            if !swarm.is_connected(&peer) {
+                                println!("[NETWORK] DHT located {}. Initiating connection...", peer);
+                                if let Err(e) = swarm.dial(peer) {
+                                    println!("[ERROR] Dial failed: {:?}", e);
+                                }
+                            }
+                            pending_dials.remove(&peer);
                         }
                     }
                 }
@@ -310,7 +371,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(peer) = peer_id {
                         let err_str = format!("{:?}", error);
                         
-                        // [FIX] Aggressively filter out OS-level connection resets and internet static
                         let is_noise = err_str.contains("Timeout") || err_str.contains("HandshakeTimedOut") ||
                                        err_str.contains("Connection refused") || err_str.contains("MultiaddrNotSupported") ||
                                        err_str.contains("ConnectionReset") || err_str.contains("NetworkUnreachable") ||
@@ -377,6 +437,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             signature,
                         });
 
+                        // [NEW] Connection Success Message
+                        println!("[SYSTEM] 🟢 Secure connection to {} fully established and verified. Ready to chat!", peer);
+
                         let known_leaves = db.lock().unwrap().get_latest_leaves().unwrap_or_default();
                         swarm.behaviour_mut().req_res.send_request(&peer, sync::SyncRequest { known_leaves });
                     }
@@ -394,6 +457,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         tokio::task::spawn_blocking(move || {
                             let _ = db_clone.lock().unwrap().save_peer_keys(&peer_str, &response.x25519_pub, &response.mlkem_pub, &response.signature);
                         }).await.unwrap();
+
+                        // [NEW] Connection Success Message
+                        println!("[SYSTEM] 🟢 Secure connection to {} fully established and verified. Ready to chat!", peer);
 
                         let known_leaves = db.lock().unwrap().get_latest_leaves().unwrap_or_default();
                         swarm.behaviour_mut().req_res.send_request(&peer, sync::SyncRequest { known_leaves });
