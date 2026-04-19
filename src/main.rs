@@ -20,6 +20,10 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{self, AsyncBufReadExt};
 use rand_core::RngCore;
 
+// Added tracing imports for the firehose log file
+use tracing::{info, debug, warn, error, trace};
+use tracing_subscriber::{fmt, EnvFilter};
+
 use store::{DagMessage, Store};
 use kex::{KexRequest, KexResponse, KEX_PROTOCOL_NAME};
 
@@ -45,8 +49,23 @@ struct SwarmProtocol {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // --- 1. INITIALIZE FIREHOSE LOGGING TO FILE ---
+    // This runs in a non-blocking background thread to avoid slowing down the P2P engine.
+    let file_appender = tracing_appender::rolling::never(".", "swarm_daemon.log");
+    let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::fmt()
+        // Here we capture ALL libp2p network traffic, kademlia events, and QUIC handshakes
+        .with_env_filter(EnvFilter::new("debug,libp2p_kad=trace,libp2p_swarm=trace,libp2p_quic=debug,libp2p_tcp=debug,project_swarm_daemon=trace"))
+        .with_writer(non_blocking_writer)
+        .with_ansi(false) // No terminal color codes in the text file
+        .init();
+
+    info!("--- SWARM DAEMON BOOT SEQUENCE INITIATED ---");
+
     let db = Arc::new(Mutex::new(Store::new().expect("Failed to initialize SQLite database")));
     println!("[SYSTEM] Local DAG database initialized.");
+    info!("Database initialized successfully.");
 
     println!("[SYSTEM] Generating Hybrid X25519 + ML-KEM Cryptographic Keys...");
     let my_crypto_id = crypto::HybridIdentity::generate();
@@ -55,10 +74,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_key = match std::fs::read(key_path) {
         Ok(bytes) => {
             println!("[SYSTEM] Loading existing network identity from disk...");
+            info!("Loaded identity from disk.");
             identity::Keypair::from_protobuf_encoding(&bytes).expect("Valid identity file")
         }
         Err(_) => {
             println!("[SYSTEM] Generating NEW network identity...");
+            info!("Generated new Ed25519 identity.");
             let new_key = identity::Keypair::generate_ed25519();
             std::fs::write(key_path, new_key.to_protobuf_encoding().unwrap()).expect("Failed to save key");
             new_key
@@ -68,6 +89,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_peer_id = PeerId::from(local_key.public());
     let local_author_id = local_peer_id.to_string();
     println!("[SYSTEM] Quantum-resistant identity secured. Node ID: {}", local_peer_id);
+    info!("Node PeerId: {}", local_peer_id);
 
     let message_id_fn = |message: &gossipsub::Message| {
         let mut s = DefaultHasher::new();
@@ -76,7 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(Duration::from_secs(10))
+        .heartbeat_interval(Duration::from_secs(5)) // Sped up heartbeat for faster mesh updates
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(message_id_fn)
         .build()
@@ -87,7 +109,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         gossipsub_config,
     ).expect("Valid gossipsub setup");
 
-    // We start in the global alpha room by default
     let mut current_topic = "swarm-alpha".to_string();
     let initial_topic = gossipsub::IdentTopic::new(current_topic.clone());
     gossipsub_behaviour.subscribe(&initial_topic).unwrap();
@@ -97,8 +118,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         local_key.public().to_peer_id()
     )?;
 
+    // --- 2. KADEMLIA DHT TUNING FOR SPEED ---
+    let mut kad_config = kad::Config::default();
+    // Reduce the query timeout so the DHT doesn't hang for 60 seconds searching dead global nodes
+    kad_config.set_query_timeout(Duration::from_secs(15));
+    // Require fewer peers to replicate our provider record, drastically speeding up the 'providing' phase
+    kad_config.set_replication_factor(std::num::NonZeroUsize::new(2).unwrap());
+
     let kad_store = kad::store::MemoryStore::new(local_peer_id);
-    let mut kad_behaviour = kad::Behaviour::new(local_peer_id, kad_store);
+    let mut kad_behaviour = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
     kad_behaviour.set_mode(Some(kad::Mode::Server));
 
     let req_res_behaviour = request_response::cbor::Behaviour::new(
@@ -137,19 +165,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
-        .with_quic() // UDP hole-punching support
+        .with_quic() 
         .with_dns()? 
         .with_behaviour(|_| behaviour)?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
     let static_port = 4001;
-    // Primary: Listen on QUIC (UDP)
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", static_port).parse()?)?;
-    // Fallback: Listen on TCP
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", static_port).parse()?)?;
 
     println!("[NETWORK] Bootstrapping to global P2P infrastructure...");
+    info!("Bootstrapping to hardcoded libp2p nodes...");
     for node in BOOTSTRAP_NODES {
         if let Ok(addr) = node.parse::<Multiaddr>() {
             let _ = swarm.dial(addr.clone());
@@ -186,6 +213,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("Give this command to your friend:");
                     println!("  /join {}", invite_hash);
                     println!("-------------------------------");
+                    info!("Generated invite for room: {}", invite_hash);
                     
                     let old_topic = gossipsub::IdentTopic::new(current_topic.clone());
                     let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&old_topic);
@@ -205,6 +233,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let target_room = input.strip_prefix("/join ").unwrap().trim().to_string();
                     
                     println!("[NETWORK] Joining private room '{}' and searching DHT...", target_room);
+                    info!("Initiated /join to room {}", target_room);
                     
                     let old_topic = gossipsub::IdentTopic::new(current_topic.clone());
                     let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&old_topic);
@@ -222,6 +251,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 if input == "/discover" {
                     println!("[NETWORK] Querying Global DHT for public swarm nodes...");
+                    info!("Querying DHT for rendezvous key...");
                     swarm.behaviour_mut().kademlia.get_providers(rendezvous_key.clone());
                     continue;
                 }
@@ -230,9 +260,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let target = input.strip_prefix("/connect ").unwrap().trim();
                     if let Ok(addr) = target.parse::<Multiaddr>() {
                         println!("[NETWORK] Dialing direct Multiaddr {}...", addr);
+                        info!("Direct dial to {}", addr);
                         let _ = swarm.dial(addr);
                     } else if let Ok(peer) = target.parse::<PeerId>() {
                         println!("[NETWORK] Resolving Peer {} on DHT...", peer);
+                        info!("Searching Kademlia for closest peers to {}", peer);
                         swarm.behaviour_mut().kademlia.get_closest_peers(peer);
                         pending_dials.insert(peer);
                     } else {
@@ -278,6 +310,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     let topic_to_publish = gossipsub::IdentTopic::new(current_topic.clone());
                                     let _ = swarm.behaviour_mut().gossipsub.publish(topic_to_publish, payload);
                                     println!("[BROADCAST] 🟢 ML-KEM encrypted whisper sent to {}.", target_peer);
+                                    info!("Whisper successfully encrypted and sent to {}", target_peer);
                                 }
                             } else {
                                 println!("[ERROR] Public keys for {} not found in database.", target_peer);
@@ -308,26 +341,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 match swarm.behaviour_mut().gossipsub.publish(topic_to_publish, payload) {
                     Ok(_) => {
                         println!("[BROADCAST] 🟢 Message (Hash: {}) successfully encrypted and sent to channel.", &parents.id[..8]);
+                        debug!("Gossipsub published msg {}", &parents.id[..8]);
                     } 
                     Err(gossipsub::PublishError::InsufficientPeers) => {
                         println!("[SYSTEM] 🟡 No active peers in room. (Message Hash: {} saved locally. Will sync upon connection.)", &parents.id[..8]);
+                        warn!("Gossipsub dropped message due to InsufficientPeers. Saved to local DAG.");
                     }
-                    Err(e) => println!("[ERROR] 🔴 Publish error: {e:?}"),
+                    Err(e) => {
+                        println!("[ERROR] 🔴 Publish error: {e:?}");
+                        error!("Gossipsub core engine fault: {:?}", e);
+                    }
                 }
             }
             
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Dcutr(event)) => {
                     println!("[NETWORK] 🥊 DCUtR Hole Punch Event: {:?}. Connection Commandeered!", event);
+                    info!("DCUtR Hole Punch success: {:?}", event);
                 },
 
-                SwarmEvent::Behaviour(SwarmProtocolEvent::Identify(identify::Event::Received { peer_id, info })) => {
-                    let observed_ip = info.observed_addr.clone();
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Identify(identify::Event::Received { peer_id, info: id_info })) => {
+                    trace!("Identify info received from {}: {:?}", peer_id, id_info);
+                    let observed_ip = id_info.observed_addr.clone();
                     if !listen_addrs.contains(&observed_ip) && listen_addrs.len() < 6 {
                         listen_addrs.push(observed_ip.clone());
                         let _ = swarm.add_external_address(observed_ip);
                     }
-                    for addr in info.listen_addrs {
+                    for addr in id_info.listen_addrs {
                         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                     }
                     
@@ -336,8 +376,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         is_providing = true;
                     }
 
-                    // WAIT for Identify to confirm protocol support before initiating the Kex Handshake
-                    if info.protocols.contains(&kex::KEX_PROTOCOL_NAME) {
+                    if id_info.protocols.contains(&kex::KEX_PROTOCOL_NAME) {
+                        debug!("Peer {} supports KEX. Initiating secure key exchange.", peer_id);
                         let mut payload_to_sign = my_crypto_id.x25519_public.to_bytes().to_vec();
                         payload_to_sign.extend_from_slice(my_crypto_id.mlkem_public.as_bytes());
                         let signature = local_key.sign(&payload_to_sign).unwrap();
@@ -360,6 +400,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if provider != local_peer_id && !swarm.is_connected(&provider) {
                             if known_providers.insert(provider) {
                                 println!("[NETWORK] 🎯 Found Peer on DHT: {}. Negotiating connection...", provider);
+                                info!("Discovered provider {} on DHT. Initiating dial.", provider);
                                 let _ = swarm.dial(provider);
                                 pending_dials.insert(provider);
                             }
@@ -374,7 +415,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if pending_dials.contains(&peer) {
                             if !swarm.is_connected(&peer) {
                                 println!("[NETWORK] DHT located {}. Initiating connection...", peer);
+                                info!("DHT located closest peer {}. Dialing.", peer);
                                 if let Err(e) = swarm.dial(peer) {
+                                    error!("Dial failed immediately for peer {}: {:?}", peer, e);
                                     println!("[ERROR] Dial failed: {:?}", e);
                                 }
                             }
@@ -383,9 +426,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                SwarmEvent::OutgoingConnectionError { peer_id, error: net_err, .. } => {
                     if let Some(peer) = peer_id {
-                        let err_str = format!("{:?}", error);
+                        let err_str = format!("{:?}", net_err);
                         
                         let is_noise = err_str.contains("Timeout") || err_str.contains("HandshakeTimedOut") ||
                                        err_str.contains("Connection refused") || err_str.contains("MultiaddrNotSupported") ||
@@ -394,7 +437,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                        err_str.contains("error: Failed");
                                        
                         if !is_noise {
-                            println!("[ERROR] Failed to dial {}: {:?}", peer, error);
+                            println!("[ERROR] Failed to dial {}: {:?}", peer, net_err);
+                            error!("Outgoing connection error to {}: {:?}", peer, net_err);
+                        } else {
+                            debug!("Routine connection drop (likely NAT/Timeout) to {}: {:?}", peer, net_err);
                         }
                         
                         pending_dials.remove(&peer);
@@ -402,6 +448,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    info!("Base network connection established with {}", peer_id);
                     match endpoint {
                         libp2p::core::ConnectedPoint::Dialer { address, .. } => {
                             swarm.behaviour_mut().kademlia.add_address(&peer_id, address.clone());
@@ -411,16 +458,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                    // Kex Handshake removed from here, successfully relocated to Identify logic above.
                 }
 
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Kex(request_response::Event::Message { peer, message })) => match message {
                     request_response::Message::Request { request, channel, .. } => {
+                        debug!("Received KEX request from {}", peer);
                         let mut verify_payload = request.x25519_pub.clone();
                         verify_payload.extend_from_slice(&request.mlkem_pub);
                         
                         let pub_key = libp2p::identity::PublicKey::try_decode_protobuf(&peer.to_bytes()[2..]).unwrap();
                         if !pub_key.verify(&verify_payload, &request.signature) {
+                            warn!("Cryptographic signature verification failed for peer {}", peer);
                             continue;
                         }
                         
@@ -442,16 +490,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         });
 
                         println!("[SYSTEM] 🟢 Secure connection to {} fully established and verified. Ready to chat!", peer);
+                        info!("Secure KEX phase completed with {}", peer);
 
                         let known_leaves = db.lock().unwrap().get_latest_leaves().unwrap_or_default();
                         swarm.behaviour_mut().req_res.send_request(&peer, sync::SyncRequest { known_leaves });
                     }
                     request_response::Message::Response { response, .. } => {
+                        debug!("Received KEX response from {}", peer);
                         let mut verify_payload = response.x25519_pub.clone();
                         verify_payload.extend_from_slice(&response.mlkem_pub);
                         
                         let pub_key = libp2p::identity::PublicKey::try_decode_protobuf(&peer.to_bytes()[2..]).unwrap();
                         if !pub_key.verify(&verify_payload, &response.signature) {
+                            warn!("Cryptographic signature verification failed for peer {}", peer);
                             continue;
                         }
                         
@@ -462,6 +513,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }).await.unwrap();
 
                         println!("[SYSTEM] 🟢 Secure connection to {} fully established and verified. Ready to chat!", peer);
+                        info!("Secure KEX phase completed with {}", peer);
 
                         let known_leaves = db.lock().unwrap().get_latest_leaves().unwrap_or_default();
                         swarm.behaviour_mut().req_res.send_request(&peer, sync::SyncRequest { known_leaves });
@@ -474,6 +526,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let text = String::from_utf8_lossy(&decrypted);
                             let sender = message.source.map(|p| p.to_string()).unwrap_or_else(|| "Unknown".to_string());
                             println!("[WHISPER] From [{}]: {}", &sender[..8], text);
+                            info!("Decrypted incoming whisper from {}", sender);
                         }
                     } 
                     else if let Ok(dag_msg) = serde_json::from_slice::<DagMessage>(&message.data) {
@@ -482,12 +535,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = db_clone.lock().unwrap().save_message(&dag_msg);
                             println!("[{}] (Hash: {}): {}", &dag_msg.author[..8], &dag_msg.id[..8], dag_msg.content);
                         }).await.unwrap();
+                        debug!("Processed incoming Gossipsub DAG message: {}", dag_msg.id);
                     }
                 }
                 
                 SwarmEvent::Behaviour(SwarmProtocolEvent::ReqRes(event)) => match event {
-                    request_response::Event::Message { peer, message } => match message {
+                    request_response::Event::Message { peer, message: req_msg } => match req_msg {
                         request_response::Message::Request { request, channel, .. } => {
+                            debug!("DAG Sync Request received from {}", peer);
                             let db_clone = Arc::clone(&db);
                             let missing = tokio::task::spawn_blocking(move || {
                                 db_clone.lock().unwrap().get_messages_after(&request.known_leaves).unwrap_or_default()
@@ -501,6 +556,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         request_response::Message::Response { response, .. } => {
                             if !response.missing_messages.is_empty() {
                                 println!("[SYNC] Received {} missing messages from {}", response.missing_messages.len(), peer);
+                                info!("DAG Sync Response: Ingesting {} missing blocks from {}", response.missing_messages.len(), peer);
                                 let db_clone = Arc::clone(&db);
                                 tokio::task::spawn_blocking(move || {
                                     let lock = db_clone.lock().unwrap();
