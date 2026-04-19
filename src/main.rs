@@ -10,6 +10,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     identity, PeerId, Multiaddr, tcp, noise, yamux
 };
+use libp2p::multiaddr::Protocol;
 use pqcrypto_traits::kem::PublicKey;
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -22,6 +23,7 @@ use tokio::io::{self, AsyncBufReadExt};
 use store::{DagMessage, Store};
 use kex::{KexRequest, KexResponse, KEX_PROTOCOL_NAME};
 
+// Public DHT backbone nodes (Used strictly for peer discovery and STUN/Relay negotiation)
 const BOOTSTRAP_NODES: &[&str] = &[
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXBPxW8V92uMb",
@@ -50,7 +52,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[SYSTEM] Generating Hybrid X25519 + ML-KEM Cryptographic Keys...");
     let my_crypto_id = crypto::HybridIdentity::generate();
     
-    // --- IDENTITY PERSISTENCE ---
     let key_path = "swarm_network_key.bin";
     let local_key = match std::fs::read(key_path) {
         Ok(bytes) => {
@@ -145,6 +146,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", static_port).parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", static_port).parse()?)?;
 
+    // 1. Connect to the public backbone to access the DHT
+    println!("[NETWORK] Bootstrapping to global P2P infrastructure...");
     for node in BOOTSTRAP_NODES {
         if let Ok(addr) = node.parse::<Multiaddr>() {
             let _ = swarm.dial(addr.clone());
@@ -152,13 +155,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let _ = swarm.behaviour_mut().kademlia.bootstrap();
 
+    // 2. The Rendezvous Key (Our version of a BitTorrent Infohash)
+    let rendezvous_key = kad::RecordKey::new(&b"project-swarm-rendezvous-v1"[..]);
+
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     
-    println!("\n[SYSTEM] Network Engine is now ONLINE and ready to rock! 🚀");
-    println!("[SYSTEM] Type a message to broadcast, or type /invite to connect to peers.\n");
+    println!("\n[SYSTEM] Decentralized Mesh Engine ONLINE. 🚀");
+    println!("[SYSTEM] Transport & Payloads are end-to-end encrypted.");
+    println!("[SYSTEM] Type /discover to find peers via global DHT.\n");
 
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
     let mut pending_dials: HashSet<PeerId> = HashSet::new();
+    let mut is_providing = false;
 
     loop {
         tokio::select! {
@@ -166,43 +174,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let input = line.trim();
                 if input.is_empty() { continue; }
 
-                if input.starts_with("/connect ") {
-                    let target = input.strip_prefix("/connect ").unwrap().trim();
-                    
-                    if let Ok(addr) = target.parse::<Multiaddr>() {
-                        println!("[NETWORK] Dialing direct Multiaddr {}...", addr);
-                        let _ = swarm.dial(addr);
-                    } 
-                    else if let Ok(peer) = target.parse::<PeerId>() {
-                        println!("[NETWORK] Searching Global DHT for Peer {}...", peer);
-                        swarm.behaviour_mut().kademlia.get_closest_peers(peer);
-                        pending_dials.insert(peer);
-                    } 
-                    else {
-                        println!("[ERROR] Invalid address or PeerId format.");
-                    }
+                // [NEW] BitTorrent-style Swarm Discovery
+                if input == "/discover" {
+                    println!("[NETWORK] Querying Global DHT for nodes providing 'project-swarm-rendezvous-v1'...");
+                    swarm.behaviour_mut().kademlia.get_providers(rendezvous_key.clone());
                     continue;
                 }
 
-                if input == "/invite" {
-                    println!("--- YOUR MAGIC INVITE LINKS ---");
-                    println!("🌐 Global DHT Invite (No IP Required):");
-                    println!("/connect {}", local_peer_id);
-                    
-                    println!("\n📡 Direct IP Fallbacks:");
-                    for addr in &listen_addrs {
-                        let addr_str = addr.to_string();
-                        if addr_str.contains("/127.0.0.1/") || 
-                           addr_str.contains("/169.254.") || 
-                           addr_str.contains("/172.") || 
-                           addr_str.contains("/10.") ||
-                           (addr_str.contains("/192.168.") && !addr_str.contains("/192.168.1.")) {
-                            continue;
-                        }
-                        println!("/connect {}/p2p/{}", addr, local_peer_id);
+                if input.starts_with("/connect ") {
+                    let target = input.strip_prefix("/connect ").unwrap().trim();
+                    if let Ok(addr) = target.parse::<Multiaddr>() {
+                        println!("[NETWORK] Dialing direct Multiaddr {}...", addr);
+                        let _ = swarm.dial(addr);
+                    } else if let Ok(peer) = target.parse::<PeerId>() {
+                        println!("[NETWORK] Resolving Peer {} on DHT...", peer);
+                        swarm.behaviour_mut().kademlia.get_closest_peers(peer);
+                        pending_dials.insert(peer);
+                    } else {
+                        println!("[ERROR] Invalid address or PeerId format.");
                     }
-                    println!("------------------------------------");
-                    continue; 
+                    continue;
                 }
 
                 if input == "/history" {
@@ -276,11 +267,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             
             event = swarm.select_next_some() => match event {
+                // [NEW] DCUtR Hole Punch Notification
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Dcutr(event)) => {
+                    println!("[NETWORK] 🥊 DCUtR Hole Punch Event: {:?}. Connection Commandeered!", event);
+                },
+
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Identify(identify::Event::Received { peer_id, info })) => {
                     let observed_ip = info.observed_addr.clone();
-                    
-                    // FIX: Stop the ephemeral port explosion caused by Symmetric NAT.
-                    // We cap the list at 6 total listen addresses so it doesn't flood the /invite menu.
                     if !listen_addrs.contains(&observed_ip) && listen_addrs.len() < 6 {
                         listen_addrs.push(observed_ip.clone());
                         let _ = swarm.add_external_address(observed_ip);
@@ -288,11 +281,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     for addr in info.listen_addrs {
                         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                     }
+                    
+                    // Once we establish identity with the DHT, start providing the rendezvous hash
+                    if !is_providing {
+                        let _ = swarm.behaviour_mut().kademlia.start_providing(rendezvous_key.clone().into());
+                        is_providing = true;
+                        println!("[NETWORK] Broadcasting presence to the DHT swarm hash...");
+                    }
                 }
 
-                SwarmEvent::Behaviour(SwarmProtocolEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer, addr) in list {
-                        swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+                // [NEW] Handling the response from /discover
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
+                    result: kad::QueryResult::GetProviders(Ok(ok)), .. 
+                })) => {
+                    for provider in ok.providers {
+                        if provider != local_peer_id && !swarm.is_connected(&provider) {
+                            println!("[NETWORK] 🎯 Found Swarm Node on DHT: {}. Negotiating connection...", provider);
+                            let _ = swarm.dial(provider);
+                        }
                     }
                 }
 
@@ -315,34 +321,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     if let Some(peer) = peer_id {
                         let err_str = format!("{:?}", error);
-                        
-                        let is_noise = err_str.contains("Timeout") || 
-                                       err_str.contains("HandshakeTimedOut") ||
-                                       err_str.contains("Connection refused") ||
-                                       err_str.contains("ConnectionReset") ||
-                                       err_str.contains("ConnectionClosed") ||
-                                       err_str.contains("NetworkUnreachable") ||
-                                       err_str.contains("HostUnreachable") ||
-                                       err_str.contains("MultiaddrNotSupported") ||
-                                       err_str.contains("UnexpectedEof") ||
-                                       err_str.contains("WrongPeerId") ||
-                                       err_str.contains("No matching records found") ||
-                                       err_str.contains("error: Failed");
-                        
+                        let is_noise = err_str.contains("Timeout") || err_str.contains("HandshakeTimedOut") ||
+                                       err_str.contains("Connection refused") || err_str.contains("MultiaddrNotSupported");
                         if !is_noise {
                             println!("[ERROR] Failed to dial {}: {:?}", peer, error);
                         }
-                        
                         pending_dials.remove(&peer);
                     }
                 }
 
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    if !listen_addrs.contains(&address) && listen_addrs.len() < 6 {
-                        listen_addrs.push(address);
-                    }
-                }
-                
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     match endpoint {
                         libp2p::core::ConnectedPoint::Dialer { address, .. } => {
@@ -377,8 +364,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if !pub_key.verify(&verify_payload, &request.signature) {
                             continue;
                         }
-
-                        println!("[SECURITY] Authenticated KEX Request from {}", peer);
                         
                         let db_clone = Arc::clone(&db);
                         let peer_str = peer.to_string();
@@ -408,8 +393,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if !pub_key.verify(&verify_payload, &response.signature) {
                             continue;
                         }
-
-                        println!("[SECURITY] KEX Handshake successful with {}", peer);
                         
                         let db_clone = Arc::clone(&db);
                         let peer_str = peer.to_string();
@@ -465,7 +448,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                     },
-                    _ => {} // SILENCED background sync drops
+                    _ => {}
                 }
                 _ => {}
             }
