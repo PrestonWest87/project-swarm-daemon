@@ -1,6 +1,6 @@
 ## Master Technical Specification: Project Swarm
 
-This document serves as the foundational blueprint for a peer-to-peer (P2P), masterless, locally hosted communication suite. It is designed to be highly resilient, aggressively secure, and entirely independent of cloud infrastructure.
+This document serves as the foundational blueprint for a peer-to-peer (P2P), masterless, locally hosted communication suite. It is designed to be highly resilient, aggressively secure, and entirely independent of central cloud infrastructure.
 
 ---
 
@@ -42,12 +42,12 @@ Given the experimental nature of hybrid post-quantum protocols, the architecture
 
 ### 4. Networking & Swarm Protocols
 
-The system bypasses standard DNS and static IP routing to ensure users can connect seamlessly without configuring routers or exposing their home networks.
+The system relies on an emergent, opportunistic mesh architecture. It bypasses standard DNS routing and central rendezvous servers, allowing the network to heal and scale autonomously.
 
-* **Node Discovery:** Utilizes a Kademlia Distributed Hash Table (DHT). When an instance comes online, it announces its encrypted routing details to the DHT using its Public Key as the address.
-* **NAT Traversal:** Implements STUN/TURN concepts natively via libp2p's AutoNAT and UDP Hole Punching. Routers are tricked into opening direct point-to-point tunnels without manual port forwarding.
-* **Invite Links:** Formatted as `app://connect/[Target-Public-Key]#[Symmetric-Decryption-Key]`. The hash fragment ensures the decryption key never touches a DNS server or external network.
-* **Real-Time Media (WebRTC):** Voice and video streams bypass the DHT and flow directly over the established UDP tunnels. For group calls exceeding 4-5 people, the swarm dynamically elects the node with the highest bandwidth to act as a temporary Selective Forwarding Unit (SFU) to distribute the streams efficiently.
+* **Global DHT as a Phonebook:** The network utilizes the public IPFS Kademlia DHT strictly for address resolution. Nodes query public bootstrap nodes (like `bootstrap.libp2p.io`) only to ask for provider records mapped to rendezvous hashes. Once an IP is retrieved, the public node connection is dropped, and the swarm nodes dial each other directly.
+* **Emergent Relays & AutoNAT:** The network automatically provisions its own infrastructure. Upon boot, nodes use AutoNAT to test their network environments. If a node determines it is publicly reachable (via open ports or UPnP), it silently promotes itself to a Circuit Relay Server, advertising its bandwidth to the DHT to route traffic for peers trapped behind strict NATs or carrier-grade firewalls.
+* **Hole Punching (DCUtR):** When two NAT-trapped peers communicate through an emergent relay, they execute Direct Connection Upgrade through Relay (DCUtR) to punch a direct UDP tunnel, dropping the relay entirely once established.
+* **Fat Invites (Out-of-Band Bootstrapping):** To form instant micro-meshes without relying on the global DHT, invite links are generated as base64-encoded strings. These "fat" invites contain the user's exact `Multiaddr` (IP, port, and PeerID), allowing instant point-to-point dialing the moment a peer pastes the code.
 
 ---
 
@@ -66,5 +66,5 @@ Because there is no central database, the state of the chat must be mathematical
 
 The application runs purely client-side, but the underlying daemon is designed to run anywhere, from a primary desktop to headless server environments.
 
-* **Containerization:** The core Rust daemon is fully containerized. Deploying it via Docker makes it frictionless to run as an always-on node within a home lab environment, smoothly integrating with hypervisors running on Dell server architectures or management dashboards like CasaOS.
-* **Headless Mode:** The daemon can run independently of the GUI. Users can leave a lightweight daemon running on a Raspberry Pi or a NAS to act as a permanent anchor and blind courier for their swarm, while interfacing with it via the GUI on their phone or main PC.
+* **Containerization:** The core Rust daemon is fully containerized. Deploying it via Docker makes it frictionless to run as an always-on node within a homelab environment. Because of the AutoNAT emergent relay feature, dropping this container on a machine with open ports automatically strengthens the global mesh.
+* **Headless Mode:** The daemon can run independently of the GUI. Users can leave a lightweight daemon running on dedicated hardware to act as a permanent anchor and blind courier for their swarm, while interfacing with it via the GUI on their phone or main workstation.
