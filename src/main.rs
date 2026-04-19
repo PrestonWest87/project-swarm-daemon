@@ -166,6 +166,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
     let mut pending_dials: HashSet<PeerId> = HashSet::new();
     let mut is_providing = false;
+    let mut known_providers: HashSet<PeerId> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -302,17 +303,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Kademlia(kad::Event::OutboundQueryProgressed { 
-                    result: kad::QueryResult::GetClosestPeers(Ok(ok)), .. 
+                    result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })), .. 
                 })) => {
-                    for peer in ok.peers {
-                        if pending_dials.contains(&peer) {
-                            if !swarm.is_connected(&peer) {
-                                println!("[NETWORK] DHT located {}. Initiating connection...", peer);
-                                if let Err(e) = swarm.dial(peer) {
-                                    println!("[ERROR] Dial failed: {:?}", e);
-                                }
+                    for provider in providers {
+                        if provider != local_peer_id && !swarm.is_connected(&provider) {
+                            // [FIX] Only print and dial if we haven't seen them yet this session
+                            if known_providers.insert(provider) {
+                                println!("[NETWORK] 🎯 Found Swarm Node on DHT: {}. Negotiating connection...", provider);
+                                let _ = swarm.dial(provider);
+                                pending_dials.insert(provider);
                             }
-                            pending_dials.remove(&peer);
                         }
                     }
                 }
@@ -321,18 +321,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(peer) = peer_id {
                         let err_str = format!("{:?}", error);
                         
-                        // Filter out expected internet noise and localhost loops
-                        let is_noise = err_str.contains("Timeout") || 
-                                       err_str.contains("HandshakeTimedOut") ||
-                                       err_str.contains("Connection refused") || 
-                                       err_str.contains("MultiaddrNotSupported") ||
-                                       err_str.contains("NetworkUnreachable") ||
-                                       err_str.contains("No matching records found") ||
-                                       err_str.contains("WrongPeerId");
+                        // [FIX] Aggressively filter out OS-level connection resets and internet static
+                        let is_noise = err_str.contains("Timeout") || err_str.contains("HandshakeTimedOut") ||
+                                       err_str.contains("Connection refused") || err_str.contains("MultiaddrNotSupported") ||
+                                       err_str.contains("ConnectionReset") || err_str.contains("NetworkUnreachable") ||
+                                       err_str.contains("No matching records found") || err_str.contains("WrongPeerId") ||
+                                       err_str.contains("error: Failed");
                                        
                         if !is_noise {
                             println!("[ERROR] Failed to dial {}: {:?}", peer, error);
                         }
+                        
                         pending_dials.remove(&peer);
                     }
                 }
