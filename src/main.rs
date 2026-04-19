@@ -320,8 +320,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     if let Some(peer) = peer_id {
                         let err_str = format!("{:?}", error);
-                        let is_noise = err_str.contains("Timeout") || err_str.contains("HandshakeTimedOut") ||
-                                       err_str.contains("Connection refused") || err_str.contains("MultiaddrNotSupported");
+                        
+                        // Filter out expected internet noise and localhost loops
+                        let is_noise = err_str.contains("Timeout") || 
+                                       err_str.contains("HandshakeTimedOut") ||
+                                       err_str.contains("Connection refused") || 
+                                       err_str.contains("MultiaddrNotSupported") ||
+                                       err_str.contains("NetworkUnreachable") ||
+                                       err_str.contains("No matching records found") ||
+                                       err_str.contains("WrongPeerId");
+                                       
                         if !is_noise {
                             println!("[ERROR] Failed to dial {}: {:?}", peer, error);
                         }
