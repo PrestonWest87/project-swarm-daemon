@@ -9,12 +9,13 @@ libp2p = { version = "0.53", features = ["tokio", "quic", "tcp", "noise", "yamux
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tracing-appender = "0.2" # Added for high-performance background file logging
+tracing-appender = "0.2" 
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22" # ADDED: For Out-of-Band Fat Invites
 pqcrypto-mlkem = "0.1.1"
 pqcrypto-traits = "0.3" 
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }

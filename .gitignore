@@ -6,3 +6,4 @@ Cargo.lock
 *.sqlite3
 swarm_network_key.bin
 *.log
+*.md

@@ -19,18 +19,28 @@ use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use tokio::io::{self, AsyncBufReadExt};
 use rand_core::RngCore;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 
-// Added tracing imports for the firehose log file
 use tracing::{info, debug, warn, error, trace};
 use tracing_subscriber::EnvFilter;
+
 use store::{DagMessage, Store};
 use kex::{KexRequest, KexResponse, KEX_PROTOCOL_NAME};
 
+// Public IPFS Bootstrap nodes are now strictly used as an address directory.
+// We will NOT force our KEX protocol onto them.
 const BOOTSTRAP_NODES: &[&str] = &[
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXBPxW8V92uMb",
     "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
+
+// Struct for Base64 encoded invites
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FatInvite {
+    addrs: Vec<String>,
+    topic: String,
+}
 
 #[derive(NetworkBehaviour)]
 struct SwarmProtocol {
@@ -43,21 +53,19 @@ struct SwarmProtocol {
     autonat: autonat::Behaviour,
     dcutr: dcutr::Behaviour,
     relay_client: relay::client::Behaviour,
+    relay_server: relay::Behaviour, // ADDED: Server capability for emergent meshing
     upnp: upnp::tokio::Behaviour,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // --- 1. INITIALIZE FIREHOSE LOGGING TO FILE ---
-    // This runs in a non-blocking background thread to avoid slowing down the P2P engine.
     let file_appender = tracing_appender::rolling::never(".", "swarm_daemon.log");
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()
-        // Here we capture ALL libp2p network traffic, kademlia events, and QUIC handshakes
-        .with_env_filter(EnvFilter::new("debug,libp2p_kad=trace,libp2p_swarm=trace,libp2p_quic=debug,libp2p_tcp=debug,project_swarm_daemon=trace"))
+        .with_env_filter(EnvFilter::new("debug,libp2p_mdns=off,libp2p_kad=trace,libp2p_swarm=trace,libp2p_quic=debug,libp2p_tcp=debug,project_swarm_daemon=trace"))
         .with_writer(non_blocking_writer)
-        .with_ansi(false) // No terminal color codes in the text file
+        .with_ansi(false)
         .init();
 
     info!("--- SWARM DAEMON BOOT SEQUENCE INITIATED ---");
@@ -72,12 +80,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let key_path = "swarm_network_key.bin";
     let local_key = match std::fs::read(key_path) {
         Ok(bytes) => {
-            println!("[SYSTEM] Loading existing network identity from disk...");
             info!("Loaded identity from disk.");
             identity::Keypair::from_protobuf_encoding(&bytes).expect("Valid identity file")
         }
         Err(_) => {
-            println!("[SYSTEM] Generating NEW network identity...");
             info!("Generated new Ed25519 identity.");
             let new_key = identity::Keypair::generate_ed25519();
             std::fs::write(key_path, new_key.to_protobuf_encoding().unwrap()).expect("Failed to save key");
@@ -97,7 +103,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(Duration::from_secs(5)) // Sped up heartbeat for faster mesh updates
+        .heartbeat_interval(Duration::from_secs(5))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(message_id_fn)
         .build()
@@ -117,11 +123,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         local_key.public().to_peer_id()
     )?;
 
-    // --- 2. KADEMLIA DHT TUNING FOR SPEED ---
     let mut kad_config = kad::Config::default();
-    // Reduce the query timeout so the DHT doesn't hang for 60 seconds searching dead global nodes
     kad_config.set_query_timeout(Duration::from_secs(15));
-    // Require fewer peers to replicate our provider record, drastically speeding up the 'providing' phase
     kad_config.set_replication_factor(std::num::NonZeroUsize::new(2).unwrap());
 
     let kad_store = kad::store::MemoryStore::new(local_peer_id);
@@ -145,6 +148,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let autonat_behaviour = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
     let (_relay_transport, relay_client_behaviour) = relay::client::new(local_peer_id);
+    let relay_server_behaviour = relay::Behaviour::new(local_peer_id, relay::Config::default()); // Added
     let dcutr_behaviour = dcutr::Behaviour::new(local_peer_id);
     let upnp_behaviour = upnp::tokio::Behaviour::default();
 
@@ -158,6 +162,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         autonat: autonat_behaviour,
         dcutr: dcutr_behaviour,
         relay_client: relay_client_behaviour,
+        relay_server: relay_server_behaviour,
         upnp: upnp_behaviour,
     };
 
@@ -174,8 +179,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", static_port).parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", static_port).parse()?)?;
 
-    println!("[NETWORK] Bootstrapping to global P2P infrastructure...");
-    info!("Bootstrapping to hardcoded libp2p nodes...");
+    println!("[NETWORK] Bootstrapping Global Address Directory...");
     for node in BOOTSTRAP_NODES {
         if let Ok(addr) = node.parse::<Multiaddr>() {
             let _ = swarm.dial(addr.clone());
@@ -189,7 +193,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     println!("\n[SYSTEM] Decentralized Mesh Engine ONLINE. 🚀");
     println!("[SYSTEM] Transport & Payloads are end-to-end encrypted.");
-    println!("[SYSTEM] Type /invite to create a specific secure chat room.\n");
+    println!("[SYSTEM] Type /invite to generate a direct-connect bridge.\n");
 
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
     let mut pending_dials: HashSet<PeerId> = HashSet::new();
@@ -202,17 +206,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let input = line.trim();
                 if input.is_empty() { continue; }
 
+                // [UPDATED] Out-of-Band Fat Invites
                 if input == "/invite" {
                     let mut rng_bytes = [0u8; 4];
                     rand_core::OsRng.fill_bytes(&mut rng_bytes);
                     let room_code = hex::encode(rng_bytes);
                     let invite_hash = format!("swarm-room-{}", room_code);
-                    
-                    println!("--- YOUR SECURE ROOM INVITE ---");
-                    println!("Give this command to your friend:");
-                    println!("  /join {}", invite_hash);
-                    println!("-------------------------------");
-                    info!("Generated invite for room: {}", invite_hash);
                     
                     let old_topic = gossipsub::IdentTopic::new(current_topic.clone());
                     let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&old_topic);
@@ -223,28 +222,79 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     
                     let room_key = kad::RecordKey::new(&current_topic);
                     let _ = swarm.behaviour_mut().kademlia.start_providing(room_key.into());
+
+                    // Harvest local and external addresses to embed in the invite
+                    let mut raw_addrs = Vec::new();
+                    for ext in swarm.external_addresses() {
+                        raw_addrs.push(ext.to_string());
+                    }
+                    if raw_addrs.is_empty() {
+                        for local in swarm.listeners() {
+                            raw_addrs.push(local.to_string());
+                        }
+                    }
+
+                    let mut final_addrs = Vec::new();
+                    for a in raw_addrs {
+                        let ma: Multiaddr = a.parse().unwrap();
+                        if !ma.to_string().contains("/p2p/") {
+                            final_addrs.push(format!("{}/p2p/{}", ma, local_peer_id));
+                        } else {
+                            final_addrs.push(ma.to_string());
+                        }
+                    }
+
+                    let invite_data = FatInvite {
+                        addrs: final_addrs,
+                        topic: current_topic.clone(),
+                    };
+
+                    let json = serde_json::to_string(&invite_data).unwrap();
+                    let b64_invite = URL_SAFE.encode(json);
+                    
+                    println!("--- YOUR DIRECT CONNECT INVITE ---");
+                    println!("Give this command to your peer:");
+                    println!("  /join {}", b64_invite);
+                    println!("----------------------------------");
                     
                     println!("[SYSTEM] 🟡 You have moved to private room: '{}'. Waiting for peers...", current_topic);
                     continue;
                 }
 
+                // [UPDATED] Parsing Fat Invites
                 if input.starts_with("/join ") {
-                    let target_room = input.strip_prefix("/join ").unwrap().trim().to_string();
+                    let target_b64 = input.strip_prefix("/join ").unwrap().trim();
                     
-                    println!("[NETWORK] Joining private room '{}' and searching DHT...", target_room);
-                    info!("Initiated /join to room {}", target_room);
-                    
-                    let old_topic = gossipsub::IdentTopic::new(current_topic.clone());
-                    let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&old_topic);
-                    
-                    current_topic = target_room.clone();
-                    let new_topic = gossipsub::IdentTopic::new(current_topic.clone());
-                    let _ = swarm.behaviour_mut().gossipsub.subscribe(&new_topic);
-                    
-                    let room_key = kad::RecordKey::new(&current_topic);
-                    let _ = swarm.behaviour_mut().kademlia.start_providing(room_key.clone().into());
-                    swarm.behaviour_mut().kademlia.get_providers(room_key);
-                    
+                    match URL_SAFE.decode(target_b64) {
+                        Ok(json_bytes) => {
+                            if let Ok(invite_data) = serde_json::from_slice::<FatInvite>(&json_bytes) {
+                                println!("[NETWORK] Invite authenticated. Joining room: '{}'", invite_data.topic);
+                                info!("Initiated /join to room {}", invite_data.topic);
+                                
+                                let old_topic = gossipsub::IdentTopic::new(current_topic.clone());
+                                let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&old_topic);
+                                
+                                current_topic = invite_data.topic.clone();
+                                let new_topic = gossipsub::IdentTopic::new(current_topic.clone());
+                                let _ = swarm.behaviour_mut().gossipsub.subscribe(&new_topic);
+                                
+                                let room_key = kad::RecordKey::new(&current_topic);
+                                let _ = swarm.behaviour_mut().kademlia.start_providing(room_key.clone().into());
+                                
+                                // Directly dial the Multiaddrs contained in the fat invite to skip the DHT wait
+                                for addr_str in invite_data.addrs {
+                                    if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                                        println!("[NETWORK] Dialing peer directly at {}", addr);
+                                        let _ = swarm.dial(addr);
+                                    }
+                                }
+                                swarm.behaviour_mut().kademlia.get_providers(room_key);
+                            } else {
+                                println!("[ERROR] Invalid or corrupted invite format.");
+                            }
+                        }
+                        Err(_) => println!("[ERROR] Invalid Base64 invite string."),
+                    }
                     continue;
                 }
 
@@ -354,6 +404,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             
             event = swarm.select_next_some() => match event {
+                // [NEW] Emergent AutoNAT Promotion Protocol
+                SwarmEvent::Behaviour(SwarmProtocolEvent::Autonat(autonat::Event::StatusChanged { old, new })) => {
+                    info!("AutoNAT Network Detection: Status changed from {:?} to {:?}", old, new);
+                    if let autonat::NatStatus::Public(addr) = new {
+                        println!("[SYSTEM] 🌐 Public IP / Open Port Detected ({}). Promoting node to Emergent Relay Server.", addr);
+                        info!("Self-promoted to Relay Server. Listening on {}", addr);
+                    }
+                },
+
                 SwarmEvent::Behaviour(SwarmProtocolEvent::Dcutr(event)) => {
                     println!("[NETWORK] 🥊 DCUtR Hole Punch Event: {:?}. Connection Commandeered!", event);
                     info!("DCUtR Hole Punch success: {:?}", event);
@@ -417,7 +476,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 info!("DHT located closest peer {}. Dialing.", peer);
                                 if let Err(e) = swarm.dial(peer) {
                                     error!("Dial failed immediately for peer {}: {:?}", peer, e);
-                                    println!("[ERROR] Dial failed: {:?}", e);
                                 }
                             }
                             pending_dials.remove(&peer);
@@ -428,7 +486,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::OutgoingConnectionError { peer_id, error: net_err, .. } => {
                     if let Some(peer) = peer_id {
                         let err_str = format!("{:?}", net_err);
-                        
                         let is_noise = err_str.contains("Timeout") || err_str.contains("HandshakeTimedOut") ||
                                        err_str.contains("Connection refused") || err_str.contains("MultiaddrNotSupported") ||
                                        err_str.contains("ConnectionReset") || err_str.contains("NetworkUnreachable") ||
@@ -441,7 +498,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         } else {
                             debug!("Routine connection drop (likely NAT/Timeout) to {}: {:?}", peer, net_err);
                         }
-                        
                         pending_dials.remove(&peer);
                     }
                 }
@@ -533,7 +589,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         tokio::task::spawn_blocking(move || {
                             let _ = db_clone.lock().unwrap().save_message(&dag_msg);
                             println!("[{}] (Hash: {}): {}", &dag_msg.author[..8], &dag_msg.id[..8], dag_msg.content);
-                            // Move the debug log INSIDE the closure while it still owns dag_msg
                             debug!("Processed incoming Gossipsub DAG message: {}", dag_msg.id);
                         }).await.unwrap();
                     }
