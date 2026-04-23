@@ -2,6 +2,7 @@
 use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use crate::crypto::{StoredEncrypted, decrypt_for_storage, encrypt_for_storage};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DagMessage {
@@ -36,10 +37,11 @@ impl DagMessage {
 
 pub struct Store {
     conn: Connection,
+    storage_key: [u8; 32],
 }
 
 impl Store {
-    pub fn new() -> Result<Self> {
+    pub fn new(storage_key: [u8; 32]) -> Result<Self> {
         let conn = Connection::open("swarm_dag.db")?;
         
         conn.execute(
@@ -47,7 +49,8 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 author TEXT NOT NULL,
                 parents TEXT NOT NULL,
-                content TEXT NOT NULL
+                content_nonce BLOB NOT NULL,
+                content_ciphertext BLOB NOT NULL
             )",
             [],
         )?;
@@ -62,14 +65,15 @@ impl Store {
             [],
         )?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, storage_key })
     }
 
     pub fn save_message(&self, msg: &DagMessage) -> Result<()> {
+        let encrypted = encrypt_for_storage(msg.content.as_bytes(), &self.storage_key);
         let parents_json = serde_json::to_string(&msg.parents).unwrap_or_default();
         self.conn.execute(
-            "INSERT OR IGNORE INTO messages (id, author, parents, content) VALUES (?1, ?2, ?3, ?4)",
-            (&msg.id, &msg.author, &parents_json, &msg.content),
+            "INSERT OR IGNORE INTO messages (id, author, parents, content_nonce, content_ciphertext) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (&msg.id, &msg.author, &parents_json, &encrypted.nonce, &encrypted.ciphertext),
         )?;
         Ok(())
     }
@@ -93,15 +97,23 @@ impl Store {
     }
 
     pub fn get_recent_messages(&self, limit: u32) -> Result<Vec<DagMessage>> {
-        let mut stmt = self.conn.prepare("SELECT id, author, parents, content FROM messages ORDER BY rowid DESC LIMIT ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, author, parents, content_nonce, content_ciphertext FROM messages ORDER BY rowid DESC LIMIT ?1")?;
         let msg_iter = stmt.query_map([limit], |row| {
             let parents_json: String = row.get(2)?;
             let parents: Vec<String> = serde_json::from_str(&parents_json).unwrap_or_default();
+            let nonce: Vec<u8> = row.get(3)?;
+            let ciphertext: Vec<u8> = row.get(4)?;
+            let encrypted = StoredEncrypted {
+                nonce: nonce.try_into().unwrap_or([0u8; 12]),
+                ciphertext,
+            };
+            let decrypted = decrypt_for_storage(&encrypted, &self.storage_key).unwrap_or_default();
+            let content = String::from_utf8(decrypted).unwrap_or_default();
             Ok(DagMessage {
                 id: row.get(0)?,
                 author: row.get(1)?,
                 parents,
-                content: row.get(3)?,
+                content,
             })
         })?;
 
@@ -113,7 +125,7 @@ impl Store {
         Ok(messages)
     }
 
-    pub fn get_messages_after(&self, known_leaves: &[String]) -> Result<Vec<DagMessage>> {
+pub fn get_messages_after(&self, known_leaves: &[String]) -> Result<Vec<DagMessage>> {
         let mut start_rowid: i64 = 0;
         
         if !known_leaves.is_empty() {
@@ -128,17 +140,25 @@ impl Store {
             };
         }
 
-        let mut stmt = self.conn.prepare("SELECT id, author, parents, content FROM messages WHERE rowid > ?1 ORDER BY rowid ASC")?;
+        let mut stmt = self.conn.prepare("SELECT id, author, parents, content_nonce, content_ciphertext FROM messages WHERE rowid > ?1 ORDER BY rowid ASC")?;
         
         let msg_iter = stmt.query_map([start_rowid], |row| {
             let parents_json: String = row.get(2)?;
             let parents: Vec<String> = serde_json::from_str(&parents_json).unwrap_or_default();
+            let nonce: Vec<u8> = row.get(3)?;
+            let ciphertext: Vec<u8> = row.get(4)?;
+            let encrypted = StoredEncrypted {
+                nonce: nonce.try_into().unwrap_or([0u8; 12]),
+                ciphertext,
+            };
+            let decrypted = decrypt_for_storage(&encrypted, &self.storage_key).unwrap_or_default();
+            let content = String::from_utf8(decrypted).unwrap_or_default();
             
             Ok(DagMessage {
                 id: row.get(0)?,
                 author: row.get(1)?,
                 parents,
-                content: row.get(3)?,
+                content,
             })
         })?;
 

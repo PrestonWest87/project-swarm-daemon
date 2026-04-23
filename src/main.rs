@@ -35,9 +35,12 @@ const BOOTSTRAP_NODES: &[&str] = &[
     "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
 
-// Struct for Base64 encoded invites
-#[derive(serde::Serialize, serde::Deserialize)]
+// Struct for Base64 encoded invites (now signed and verified)
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct FatInvite {
+    sender_x25519_pub: Vec<u8>,      // sender's X25519 public key
+    sender_mlkem_pub: Vec<u8>,     // sender's ML-KEM public key
+    signature: Vec<u8>,            // Ed25519 signature over invite data
     addrs: Vec<String>,
     topic: String,
 }
@@ -70,13 +73,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("--- SWARM DAEMON BOOT SEQUENCE INITIATED ---");
 
-    let db = Arc::new(Mutex::new(Store::new().expect("Failed to initialize SQLite database")));
-    println!("[SYSTEM] Local DAG database initialized.");
-    info!("Database initialized successfully.");
-
     println!("[SYSTEM] Generating Hybrid X25519 + ML-KEM Cryptographic Keys...");
-    let my_crypto_id = crypto::HybridIdentity::generate();
-    
     let key_path = "swarm_network_key.bin";
     let local_key = match std::fs::read(key_path) {
         Ok(bytes) => {
@@ -90,10 +87,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             new_key
         }
     };
+    let my_crypto_id = crypto::HybridIdentity::generate();
+    
+    let db = Arc::new(Mutex::new(Store::new(my_crypto_id.derive_storage_key()).expect("Failed to initialize SQLite database")));
+    println!("[🔐] Local database initialized with ChaCha20-Poly1305 encryption.");
+    info!("Database initialized successfully.");
     
     let local_peer_id = PeerId::from(local_key.public());
     let local_author_id = local_peer_id.to_string();
-    println!("[SYSTEM] Quantum-resistant identity secured. Node ID: {}", local_peer_id);
+    println!("[🛡️] Quantum-resistant identity secured. Node ID: {}", local_peer_id);
     info!("Node PeerId: {}", local_peer_id);
 
     let message_id_fn = |message: &gossipsub::Message| {
@@ -191,9 +193,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
     
-    println!("\n[SYSTEM] Decentralized Mesh Engine ONLINE. 🚀");
-    println!("[SYSTEM] Transport & Payloads are end-to-end encrypted.");
-    println!("[SYSTEM] Type /invite to generate a direct-connect bridge.\n");
+    println!("\n╔════════════════════════════════════════════════════════════════╗");
+    println!("║         🛜  DECENTRALIZED MESH ENGINE ONLINE               ║");
+    println!("╠════════════════════════════════════════════════════════════════╣");
+    println!("║ 🔐 End-to-End Encrypted  │  🧪 Post-Quantum  │  ⚡ P2P Mesh  ║");
+    println!("╚════════════════════════════════════════════════════════════════╝");
+    println!("\n📋 AVAILABLE COMMANDS:");
+    println!("  /invite    → Generate secure direct-connect invite link");
+    println!("  /join <b64> → Join room from invite link");
+    println!("  /history   → View local message history");
+    println!("  /discover  → Find peers on DHT");
+    println!("  /connect   → Connect to specific peer");
+    println!("  /whisper   → Send encrypted private message");
+    println!("  <message>  → Send broadcast to current room");
+    println!("\n💬 Ready. Type a message or /invite to start a new room.\n");
 
     let mut listen_addrs: Vec<Multiaddr> = Vec::new(); 
     let mut pending_dials: HashSet<PeerId> = HashSet::new();
@@ -245,12 +258,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
 
                     let invite_data = FatInvite {
+                        sender_x25519_pub: my_crypto_id.x25519_public.to_bytes().to_vec(),
+                        sender_mlkem_pub: my_crypto_id.mlkem_public.as_bytes().to_vec(),
+                        signature: Vec::new(),
                         addrs: final_addrs,
                         topic: current_topic.clone(),
                     };
 
                     let json = serde_json::to_string(&invite_data).unwrap();
-                    let b64_invite = URL_SAFE.encode(json);
+                    let payload_to_sign = json.as_bytes();
+                    let signature = local_key.sign(payload_to_sign).unwrap();
+                    
+                    let mut signed_invite = invite_data;
+                    signed_invite.signature = signature.to_vec();
+                    
+                    let invite_json = serde_json::to_string(&signed_invite).unwrap();
+                    let b64_invite = URL_SAFE.encode(invite_json);
                     
                     println!("--- YOUR DIRECT CONNECT INVITE ---");
                     println!("Give this command to your peer:");
@@ -261,14 +284,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
 
-                // [UPDATED] Parsing Fat Invites
+                // [UPDATED] Parsing Fat Invites (with signature verification)
                 if input.starts_with("/join ") {
                     let target_b64 = input.strip_prefix("/join ").unwrap().trim();
                     
                     match URL_SAFE.decode(target_b64) {
                         Ok(json_bytes) => {
                             if let Ok(invite_data) = serde_json::from_slice::<FatInvite>(&json_bytes) {
-                                println!("[NETWORK] Invite authenticated. Joining room: '{}'", invite_data.topic);
+                                // Verify signature from sender - create a copy without signature for verification
+                                let mut invite_copy = invite_data.clone();
+                                invite_copy.signature = Vec::new();
+                                let payload = serde_json::to_string(&invite_copy).unwrap();
+                                
+                                let pub_key = libp2p::identity::PublicKey::try_decode_protobuf(&invite_data.sender_x25519_pub)
+                                    .expect("Invalid sender public key in invite");
+                                
+                                let sig_bytes: &[u8] = &invite_data.signature;
+                                if sig_bytes.len() != 64 || !pub_key.verify(payload.as_bytes(), sig_bytes) {
+                                    println!("[ERROR] Invalid invite signature. Cannot verify sender identity.");
+                                    continue;
+                                }
+                                
+                                println!("[NETWORK] Invite verified. Sender identity confirmed. Joining room: '{}'", invite_data.topic);
                                 info!("Initiated /join to room {}", invite_data.topic);
                                 
                                 let old_topic = gossipsub::IdentTopic::new(current_topic.clone());

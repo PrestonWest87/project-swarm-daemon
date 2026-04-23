@@ -1,9 +1,9 @@
 // src/crypto.rs
 use serde::{Deserialize, Serialize};
 use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::{Ciphertext, SharedSecret};
+use pqcrypto_traits::kem::{Ciphertext, SharedSecret, SecretKey};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
-use chacha20poly1305::{aead::{Aead, AeadCore, KeyInit}, ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::{aead::{Aead, AeadCore, KeyInit, OsRng}, ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use rand_core::OsRng as RandOsRng;
@@ -28,6 +28,38 @@ impl HybridIdentity {
             mlkem_public,
         }
     }
+
+    pub fn derive_storage_key(&self) -> [u8; 32] {
+        let mut key_input = self.x25519_secret.to_bytes().to_vec();
+        key_input.extend_from_slice(self.mlkem_secret.as_bytes());
+        let hkdf = Hkdf::<Sha256>::new(None, &key_input);
+        let mut key = [0u8; 32];
+        hkdf.expand(b"storage-key-v1", &mut key).expect("HKDF expand failed");
+        key
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEncrypted {
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+}
+
+pub fn encrypt_for_storage(plaintext: &[u8], key: &[u8; 32]) -> StoredEncrypted {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let ciphertext = cipher.encrypt(&nonce, plaintext).expect("storage encryption failed");
+    StoredEncrypted {
+        nonce: nonce.into(),
+        ciphertext,
+    }
+}
+
+pub fn decrypt_for_storage(encrypted: &StoredEncrypted, key: &[u8; 32]) -> Result<Vec<u8>, &'static str> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = Nonce::from_slice(&encrypted.nonce);
+    cipher.decrypt(nonce, encrypted.ciphertext.as_ref())
+        .map_err(|_| "storage decryption failed")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
