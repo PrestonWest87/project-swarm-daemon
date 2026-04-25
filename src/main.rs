@@ -35,14 +35,13 @@ const BOOTSTRAP_NODES: &[&str] = &[
     "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
 
-// Struct for Base64 encoded invites (now signed and verified)
+// Struct for Base64 encoded invites (minimal format)
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct FatInvite {
-    sender_x25519_pub: Vec<u8>,      // sender's X25519 public key
-    sender_mlkem_pub: Vec<u8>,     // sender's ML-KEM public key
-    signature: Vec<u8>,            // Ed25519 signature over invite data
-    addrs: Vec<String>,
     topic: String,
+    addrs: Vec<String>,
+    sender_pubkey: Vec<u8>,
+    signature: Vec<u8>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -258,11 +257,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
 
                     let invite_data = FatInvite {
-                        sender_x25519_pub: my_crypto_id.x25519_public.to_bytes().to_vec(),
-                        sender_mlkem_pub: my_crypto_id.mlkem_public.as_bytes().to_vec(),
-                        signature: Vec::new(),
-                        addrs: final_addrs,
                         topic: current_topic.clone(),
+                        addrs: final_addrs,
+                        sender_pubkey: local_key.public().encode_protobuf(),
+                        signature: Vec::new(),
                     };
 
                     let json = serde_json::to_string(&invite_data).unwrap();
@@ -296,7 +294,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 invite_copy.signature = Vec::new();
                                 let payload = serde_json::to_string(&invite_copy).unwrap();
                                 
-                                let pub_key = libp2p::identity::PublicKey::try_decode_protobuf(&invite_data.sender_x25519_pub)
+                                let pub_key = libp2p::identity::PublicKey::try_decode_protobuf(&invite_data.sender_pubkey)
                                     .expect("Invalid sender public key in invite");
                                 
                                 let sig_bytes: &[u8] = &invite_data.signature;
