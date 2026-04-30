@@ -162,12 +162,21 @@ Comprehensive documentation is available in the [docs/](docs/) directory:
 | [CRYPTO.md](docs/CRYPTO.md) | Cryptography details, algorithms, threat model |
 | [API.md](docs/API.md) | Internal API, data structures, module interfaces |
 | [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Build instructions, testing, contributing |
+| [AI_ADDENDUM.md](docs/AI_ADDENDUM.md) | AI tool attribution and transparency disclosure |
 
 ### Quick Links
 
 - **Guiding Document**: See [Guiding Doc.md](Guiding%20Doc.md) for the master technical specification
 - **libp2p Docs**: https://libp2p.io/docs/
 - **Rust Book**: https://doc.rust-lang.org/book/
+
+## 🤖 AI Assistance
+
+This project and its documentation were created with the assistance of:
+- **Google Gemini 3 Pro**: Documentation generation, technical writing, and project structuring
+- **opencode**: Interactive CLI tool (powered by `opencode/big-pickle`) for code implementation and repository management
+
+For full attribution details, see the [AI Addendum](docs/AI_ADDENDUM.md).
 
 ## 🛠️ Development
 
