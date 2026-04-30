@@ -6,4 +6,4 @@ Cargo.lock
 *.sqlite3
 swarm_network_key.bin
 *.log
-*.md
+# *.md intentionally excluded - documentation should be committed
